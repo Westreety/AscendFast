@@ -1,0 +1,3 @@
+[2026-06-03-14:16:57.048] [INFO] [AscendProfiler_CANNExportParser:97] Profiler logger initialized at: /models/share/userdata/cb/AscendFast/profiles/profile_py_yi_6b_real/codeserver-demo2-0_83806_20260603141656210_ascend_pt/logs/profiler_20260603141657_84858_CANNExportParser.log
+[2026-06-03-14:16:57.048] [INFO] [AscendProfiler_CANNExportParser:52] CANNExportParser start.
+[2026-06-03-14:17:01.096] [INFO] [AscendProfiler_CANNExportParser:80] CANNExportParser finish.

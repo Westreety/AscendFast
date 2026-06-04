@@ -1,0 +1,3 @@
+[2026-06-03-14:16:16.351] [INFO] [AscendProfiler_CANNAnalyzeParser:97] Profiler logger initialized at: /models/share/userdata/cb/AscendFast/profiles/profile_py_qwen_real/codeserver-demo2-0_82442_20260603141612661_ascend_pt/logs/profiler_20260603141616_83695_CANNAnalyzeParser.log
+[2026-06-03-14:16:16.351] [INFO] [AscendProfiler_CANNAnalyzeParser:41] CANNAnalyzeParser start.
+[2026-06-03-14:16:17.388] [INFO] [AscendProfiler_CANNAnalyzeParser:67] CANNAnalyzeParser finish.

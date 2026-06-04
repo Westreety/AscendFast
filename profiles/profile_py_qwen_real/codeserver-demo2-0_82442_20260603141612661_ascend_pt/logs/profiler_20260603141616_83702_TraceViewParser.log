@@ -1,0 +1,3 @@
+[2026-06-03-14:16:16.531] [INFO] [AscendProfiler_TraceViewParser:97] Profiler logger initialized at: /models/share/userdata/cb/AscendFast/profiles/profile_py_qwen_real/codeserver-demo2-0_82442_20260603141612661_ascend_pt/logs/profiler_20260603141616_83702_TraceViewParser.log
+[2026-06-03-14:16:16.531] [INFO] [AscendProfiler_TraceViewParser:49] TraceViewParser start.
+[2026-06-03-14:16:16.740] [INFO] [AscendProfiler_TraceViewParser:63] TraceViewParser finish.
