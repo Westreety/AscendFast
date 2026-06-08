@@ -19,7 +19,7 @@ def apply_optimization(
 
     artifacts: list[AppliedArtifact] = []
     if AGENT_ENABLED:
-        artifacts = _llm_apply_optimization(strategy, work_dir) or []
+        artifacts = _llm_apply_optimization(strategy, work_dir)
 
     return ExecutionMode(
         uid=f"mode:{strategy.uid}",
