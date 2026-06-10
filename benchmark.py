@@ -35,6 +35,7 @@ from workspace_loader import load_build_model
 from profile_npu import (
     detect_device,
     _import_torch,
+    _release_device_memory,
     _run_forward,
     _synchronize,
 )
@@ -88,23 +89,28 @@ def run_real_benchmark(
     device, _ = detect_device("auto", allow_cpu=True)
     model = model.to(device.device).eval()
 
-    # 真实 prompt → 按真实 token 长度排序后再 tokenize，减少 batch 内 padding 失真。
-    prompts = load_prompt_dataset(ds_path, max_samples=max_samples).prompts
-    prompts = _sort_by_token_length(tokenizer, prompts)
-    inputs = tokenize_prompts(
-        torch, tokenizer, prompts, device=device.device, max_length=max_input_tokens
-    )
+    try:
+        # 真实 prompt → 按真实 token 长度排序后再 tokenize，减少 batch 内 padding 失真。
+        prompts = load_prompt_dataset(ds_path, max_samples=max_samples).prompts
+        prompts = _sort_by_token_length(tokenizer, prompts)
+        inputs = tokenize_prompts(
+            torch, tokenizer, prompts, device=device.device, max_length=max_input_tokens
+        )
 
-    samples_ms = _time_forward(
-        torch, model, inputs, device.kind,
-        warmup_iters=warmup_iters, bench_iters=bench_iters,
-    )
-    stats = _latency_stats(samples_ms)
+        samples_ms = _time_forward(
+            torch, model, inputs, device.kind,
+            warmup_iters=warmup_iters, bench_iters=bench_iters,
+        )
+        stats = _latency_stats(samples_ms)
 
-    _write_report(
-        mode, ds_path, device, stats, samples_ms,
-        num_prompts=len(prompts), max_input_tokens=max_input_tokens,
-    )
+        _write_report(
+            mode, ds_path, device, stats, samples_ms,
+            num_prompts=len(prompts), max_input_tokens=max_input_tokens,
+        )
+    finally:
+        # 本节点用完即释放：不然递归深处每个父帧都还压着一个模型，显存只增不减。
+        del model
+        _release_device_memory(torch, device.kind)
 
     if stats["mean"] <= 0.0:
         raise RuntimeError("benchmark produced non-positive latency.")

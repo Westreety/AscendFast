@@ -1,0 +1,34 @@
+[project]
+name = "ascend-fast"
+version = "0.1.0"
+description = "Iterative NPU optimization pipeline for PyTorch causal LMs on Ascend"
+requires-python = ">=3.10,<3.13"
+# 核心管线运行时依赖：版本钉死成本机 CANN 8.5.0 上已验证可用的那套
+# （torch 2.7.1 / torch_npu 2.7.1.post2），不照搬 autokernel 的 >=2.8.0，
+# 避免新装的 torch 与已安装的 CANN 不匹配导致 NPU 跑不起来。
+dependencies = [
+    "torch==2.7.1",
+    "torch-npu==2.7.1.post2",
+    "transformers==4.57.1",
+    "accelerate==1.12.0",
+    "safetensors==0.7.0",
+]
+
+[project.optional-dependencies]
+# 仅 scripts/ 下的模型下载/查询用，运行时核心管线不需要。
+hub = [
+    "huggingface-hub>=0.20.0",
+]
+
+[tool.uv]
+index-strategy = "unsafe-best-match"
+
+[tool.uv.sources]
+# torch_npu 只在华为源有；torch 2.7.1 (aarch64) 也走华为源以保证与 torch_npu 同源。
+torch = [{ index = "ascend-repo" }]
+"torch-npu" = [{ index = "ascend-repo" }]
+
+[[tool.uv.index]]
+name = "ascend-repo"
+url = "https://repo.huaweicloud.com/repository/pypi/simple"
+explicit = true

@@ -27,7 +27,7 @@ from apply import _write_manifest
 from dataset import load_prompt_dataset, tokenize_prompts
 from models import ExecutionMode
 from workspace_loader import load_build_model
-from profile_npu import detect_device, _import_torch, _run_forward, _synchronize
+from profile_npu import detect_device, _import_torch, _release_device_memory, _run_forward, _synchronize
 
 _PROJECT_ROOT = Path(__file__).parent
 # 正确性检验用的固定 prompt 集：与 benchmark 同源真实数据，口径一致。
@@ -173,7 +173,11 @@ def _last_token_logits(
         last_idx = torch.full((logits.shape[0],), logits.shape[1] - 1, dtype=torch.long)
     rows = torch.arange(logits.shape[0])
     last = logits[rows, last_idx.to(logits.device)]      # [N, vocab]
-    return last.float().cpu()
+    result = last.float().cpu()                          # 先把要留的搬到 CPU
+    # 设备上的 model/out/logits 用完即释放，避免与 golden 计算同时在显存里压两份模型。
+    del model, out, logits, last
+    _release_device_memory(torch, device.kind)
+    return result
 
 
 def _accepts_kwargs(model: Any, inputs: dict[str, Any]) -> bool:

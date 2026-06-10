@@ -76,6 +76,9 @@ def apply_optimization(
     if AGENT_ENABLED:
         record = _llm_apply_optimization(strategy, base_mode, new_uid, work_dir)
 
+    # 只有产出了真 ChangeRecord 才追加——None 不入 change_log，从根上消除
+    # asdict(None) 崩溃；gate_apply 据"日志是否增长"判定这次 apply 是否有效。
+    new_change_log = base_mode.change_log + ([record] if record is not None else [])
     mode = ExecutionMode(
         uid=new_uid,
         model_id=base_mode.model_id,
@@ -83,7 +86,7 @@ def apply_optimization(
         workspace_dir=str(work_dir),
         parent_uid=base_mode.uid,
         entrypoint=base_mode.entrypoint,
-        change_log=base_mode.change_log + [record],
+        change_log=new_change_log,
     )
     _write_manifest(mode)
     return mode
@@ -174,6 +177,7 @@ def _write_manifest(mode: ExecutionMode) -> None:
         "strategy_uid": mode.strategy_uid,
         "parent_uid": mode.parent_uid,
         "entrypoint": mode.entrypoint,
+        # 如果change_log里面有一个None就会崩溃
         "change_log": [asdict(r) for r in mode.change_log],
         "correctness_passed": mode.correctness_passed,
         "extra": mode.extra,

@@ -26,6 +26,7 @@ from profile_npu import (
     detect_device,
     profile_model,
     _import_torch,
+    _release_device_memory,
 )
 
 _PROJECT_ROOT = Path(__file__).parent
@@ -127,14 +128,19 @@ def _deterministic_profile(
     prompts = load_prompt_dataset(_PROFILE_DATASET).prompts
     inputs = tokenize_prompts(torch, tokenizer, prompts, device=device.device, max_length=max_len)
 
-    records, artifacts = profile_model(
-        model, inputs, config=cfg, device=device, torch_module=torch, torch_npu=torch_npu,
-    )
-    if not records:
-        raise RuntimeError("No device events captured during profile.")
-    report = build_profile_report(records, device, cfg, "build_model", artifacts=artifacts)
-    cfg.output.parent.mkdir(parents=True, exist_ok=True)
-    cfg.output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    try:
+        records, artifacts = profile_model(
+            model, inputs, config=cfg, device=device, torch_module=torch, torch_npu=torch_npu,
+        )
+        if not records:
+            raise RuntimeError("No device events captured during profile.")
+        report = build_profile_report(records, device, cfg, "build_model", artifacts=artifacts)
+        cfg.output.parent.mkdir(parents=True, exist_ok=True)
+        cfg.output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    finally:
+        # 本节点 profile 完即释放模型，防止递归深处显存累积 OOM。
+        del model
+        _release_device_memory(torch, device.kind)
 
     latency = _to_float((report.get("latency_stats_ms") or {}).get("mean"))
     return ProfileResult(

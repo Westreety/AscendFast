@@ -652,6 +652,22 @@ def _synchronize(torch: Any, device_kind: str) -> None:
         torch.cuda.synchronize()
 
 
+def _release_device_memory(torch: Any, device_kind: str) -> None:
+    """gc + 清设备显存缓存。调用方须先 del 掉自己持有的 model/大张量引用再调本函数。
+
+    每个 ExecutionMode 节点都会 benchmark/profile/correctness 各加载一次完整模型上
+    设备；递归向下时若不释放，显存只增不减，深树必然 OOM。本函数只负责"已无引用后
+    把缓存还给设备"，与 _synchronize 同层、同 device_kind 风格；解引用由调用方做，
+    因为 Python 里 helper 删不掉调用方作用域的变量。
+    """
+    import gc
+    gc.collect()
+    if device_kind == "npu" and hasattr(torch, "npu") and hasattr(torch.npu, "empty_cache"):
+        torch.npu.empty_cache()
+    elif device_kind == "cuda" and hasattr(torch, "cuda") and hasattr(torch.cuda, "empty_cache"):
+        torch.cuda.empty_cache()
+
+
 def _load_model_from_file(model_path: str, class_name: str) -> Any:
     path = Path(model_path).resolve()
     if not path.is_file():

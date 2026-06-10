@@ -22,6 +22,39 @@ class ChangeRecord:
 
 
 @dataclass
+class StageOutcome:
+    """一个环节（benchmark/profile/analyze/strategy/apply/correctness/agent_call）
+    的成败判定，与 ChangeRecord 同构：每个环节"已经在做但形态不一"的成败判断，
+    都收敛成这一条统一记录——做了什么环节（stage）、过没过（ok）、为什么（reason）。
+
+    门禁是喂给 stage() 的纯函数；它们的返回值落到 ok/reason。异常被 stage()
+    捕获后也落成一条 ok=False 的 StageOutcome，不再带着 stacktrace 炸穿整条 run。
+    """
+    stage: str                  # benchmark|profile|analyze|strategy|apply|correctness|agent_call|decision
+    ok: bool
+    reason: str = ""            # 失败原因；成功时为 ""
+    mode_uid: str | None = None # 该环节作用/产出的 ExecutionMode.uid
+    metadata: dict | None = None
+
+
+@dataclass
+class RunLedger:
+    """一次 optimize() 的 run 级记录：这一次探索了哪棵树、每个环节成败、为什么停。
+
+    mode 级产物（manifest/report）记录单个变体；RunLedger 记录贯穿整条递归的
+    决策轨迹。确定性、离线可用，不沾 agent——agent_call 只是 outcomes 里一种
+    stage，用来把"为什么没效果"从黑盒里捞出来。
+    """
+    run_uid: str
+    model_id: str
+    outcomes: list["StageOutcome"] = field(default_factory=list)
+    stop_reason: str | None = None      # reached_2x|max_depth|no_strategies|exhausted|stage_failed:<stage>
+    best_mode_uid: str | None = None
+    best_latency: float | None = None
+    baseline_latency: float | None = None
+
+
+@dataclass
 class OptimizationStrategy:
     uid: str
     local_speedup_ratio: float
