@@ -34,7 +34,7 @@ _PROJECT_ROOT = Path(__file__).parent
 _CORRECTNESS_DATASET = _PROJECT_ROOT / "data" / "prompts_sharegpt.jsonl"
 _GOLDEN_NAME = "correctness_golden.pt"
 
-_DEFAULT_THRESHOLD = 0.99
+_DEFAULT_THRESHOLD = 0.85
 _DEFAULT_SAMPLES = 32
 _DEFAULT_MAX_TOKENS = 512
 

@@ -59,15 +59,43 @@ def load_build_model(mode: ExecutionMode) -> tuple[Any, Any]:
         model, tokenizer = module.build_model()
         return model, tokenizer
     finally:
-        # 还原：只删"文件位于本 workspace 内"的新缓存模块（即 fork 自带的入口与裸名
-        # 辅助文件 patches/config/...），让下一个 fork 不会拿到本 fork 的同名模块。
-        # 刻意不动 transformers_modules.* 等 trust_remote_code 动态模块——刚建好的
-        # model 仍依赖它们留在 sys.modules，全删会反噬当前模型。
-        ws_str = str(ws)
+        # 还原：删掉"定位落在本 workspace 内"的新缓存模块（fork 自带的入口与裸名
+        # 辅助包 patches/config/...），让下一个 fork 不会拿到本 fork 的同名模块。
+        # 关键：既看 __file__（普通模块/有 __init__.py 的包），也看 __path__（包，
+        # 含缺 __init__.py 的 namespace package——它 __file__ 为 None，只有 __path__
+        # 指向 ws）。只看 __file__ 会漏掉 namespace package，使其永久残留：下一个
+        # fork 的 `from patches import X` 会命中这个陈旧缓存——静默跑错代码，或
+        # 报 `(unknown location)` ImportError。
+        # 刻意不动 transformers_modules.* 等 trust_remote_code 动态模块——它们的定位
+        # 在 HF 缓存目录、不在 ws 内，刚建好的 model 仍依赖它们留在 sys.modules。
         for name in set(sys.modules) - modules_before:
             mod = sys.modules.get(name)
-            mod_file = getattr(mod, "__file__", None)
-            if mod_file and str(Path(mod_file).resolve()).startswith(ws_str):
-                del sys.modules[name]
+            # 关键：从 mod.__dict__ 直接取，不用 getattr。某些惰性模块（如
+            # torch_npu.dynamo）定义了 __getattr__，getattr(mod, "__path__") 会
+            # 惊动它触发子 import（torchair → pkg_resources）从而抛错。__dict__
+            # 是普通字典读取，只看模块"已实际设置"的属性，无副作用。
+            mod_dict = getattr(mod, "__dict__", None)
+            if not mod_dict:
+                continue
+            locations = []
+            mod_file = mod_dict.get("__file__")
+            if mod_file:
+                locations.append(mod_file)
+            # __path__ 多数是路径字符串的可迭代对象，但有些库会把非标准对象塞进
+            # __path__（如 torch_npu 的 _ClassNamespace 不可迭代）。安全收集：迭代
+            # 失败或元素非字符串都跳过，绝不让清理逻辑因这种模块整体抛错。
+            mod_path = mod_dict.get("__path__")
+            if mod_path is not None:
+                try:
+                    locations.extend(p for p in mod_path if isinstance(p, (str, bytes)))
+                except TypeError:
+                    pass
+            for loc in locations:
+                try:
+                    if Path(loc).resolve().is_relative_to(ws):
+                        del sys.modules[name]
+                        break
+                except (ValueError, OSError, TypeError):
+                    continue
         if path_added and str(ws) in sys.path:
             sys.path.remove(str(ws))

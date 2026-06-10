@@ -1,15 +1,15 @@
-# AscendFast — Project Context for All Agents
+# AscendFast — 所有 agent 的项目上下文
 
-## Hardware & Runtime
+## 硬件 & 运行时
 
-- Device: Ascend 910 NPU (`npu:0`)
+- 设备：Ascend 910 NPU (`npu:0`)
 - torch_npu: 2.7.1.post2
 - transformers: 4.57.1
 - Python: 3.10
 - venv: `/models/share/userdata/cb/AscendFast/.venv`
-- Run commands from project root: `/models/share/userdata/cb/AscendFast`
+- 命令从项目根目录运行：`/models/share/userdata/cb/AscendFast`
 
-## transformers 4.57.1 — Available Qwen2 classes
+## transformers 4.57.1 — 可用的 Qwen2 类
 
 ```python
 # AVAILABLE
@@ -20,7 +20,7 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention
 # Qwen2SdpaAttention     (added in transformers ≥ 4.40, not present here)
 ```
 
-## torch_npu fused ops (check before use)
+## torch_npu fused ops（使用前先检查）
 
 ```python
 import torch_npu
@@ -29,10 +29,10 @@ hasattr(torch_npu, "npu_rotary_mul")    # check at runtime
 # Always guard with hasattr() — never assume a fused op exists
 ```
 
-## Critical import rule for build_model.py
+## build_model.py 的关键 import 规则
 
-All `from patches import ...` statements MUST be inside the `build_model()`
-function body, NOT at module top-level:
+所有 `from patches import ...` 语句必须写在 `build_model()` 函数体内，**不能**
+放在模块顶层：
 
 ```python
 # CORRECT
@@ -45,14 +45,13 @@ def build_model(...):
 from patches import my_patch       # top-level
 ```
 
-This is because `workspace_loader.py` isolates each workspace's modules by
-snapshotting `sys.modules` before and after import. A top-level patch import
-runs at `exec_module()` time and can collide with a same-named `patches`
-package from a previously loaded workspace.
+这是因为 `workspace_loader.py` 通过在 import 前后快照 `sys.modules` 来隔离每个
+workspace 的模块。顶层的 patch import 会在 `exec_module()` 时执行，可能与之前
+加载过的某个 workspace 里同名的 `patches` 包发生冲突。
 
-## Mandatory smoke test for optimization-agent
+## optimization-agent 的强制 smoke test
 
-After writing any code, run this before returning JSON:
+写完任何代码后，返回 JSON 之前先运行这个：
 
 ```bash
 cd /models/share/userdata/cb/AscendFast && python -c "
@@ -66,10 +65,9 @@ print('smoke OK, build_model:', type(m.build_model))
 "
 ```
 
-If it raises any exception, fix the code first. Do not return JSON with a
-broken workspace.
+若它抛出任何异常，先修代码。不要在 workspace 损坏的情况下返回 JSON。
 
-## Project layout
+## 项目布局
 
 ```
 model/                  # original weights (read-only)
@@ -83,11 +81,11 @@ data/
 runs/                   # RunLedger JSON files (one per optimization run)
 ```
 
-## Agent roles (do not cross boundaries)
+## Agent 职责（不要越界）
 
-| Agent | Does | Does NOT |
+| Agent | 做什么 | 不做什么 |
 |---|---|---|
-| profile-agent | run profiler, return paths + latency | interpret results |
-| analysis-agent | identify WHERE time is spent | propose fixes |
-| strategy-agent | propose WHAT to optimize | write code |
-| optimization-agent | write + verify code | invent strategies |
+| profile-agent | 跑 profiler，返回路径 + 延迟 | 解读结果 |
+| analysis-agent | 找出时间花在**哪里** | 提出修复方案 |
+| strategy-agent | 提出优化**什么** | 写代码 |
+| optimization-agent | 写代码 + 验证 | 发明策略 |
