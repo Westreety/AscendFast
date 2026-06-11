@@ -47,6 +47,7 @@ def load_build_model(mode: ExecutionMode) -> tuple[Any, Any]:
     path_added = str(ws) not in sys.path
     if path_added:
         sys.path.insert(0, str(ws))
+    # modules 相当于是一个文件夹里的文件
     modules_before = set(sys.modules)
     try:
         spec = importlib.util.spec_from_file_location(f"_mode_entry_{ws.name}", entry)
@@ -54,8 +55,10 @@ def load_build_model(mode: ExecutionMode) -> tuple[Any, Any]:
             raise ImportError(f"cannot load entrypoint: {entry}")
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
+        
         if not hasattr(module, "build_model"):
             raise AttributeError(f"{entry} does not expose build_model()")
+        
         model, tokenizer = module.build_model()
         return model, tokenizer
     finally:

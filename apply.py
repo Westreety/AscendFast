@@ -76,6 +76,15 @@ def apply_optimization(
     if AGENT_ENABLED:
         record = _llm_apply_optimization(strategy, base_mode, new_uid, work_dir)
 
+    # 运行门禁：agent 说自己改完了，但融合/自定义算子的参数错误（dtype/shape/布局）
+    # 只在 forward 时才炸——构造能过、前向才挂。这里在接受这条 record 之前实际跑一次
+    # 前向；跑不通就丢弃 record，于是 gate_apply 据"日志没增长"判这次 apply 无效，
+    # 既不进 correctness（不会留下 correctness_passed=null），也不会递归进一个坏 mode。
+    if record is not None and not _workspace_forward_ok(
+        new_uid, base_mode, work_dir, record
+    ):
+        record = None
+
     # 只有产出了真 ChangeRecord 才追加——None 不入 change_log，从根上消除
     # asdict(None) 崩溃；gate_apply 据"日志是否增长"判定这次 apply 是否有效。
     new_change_log = base_mode.change_log + ([record] if record is not None else [])
@@ -90,6 +99,57 @@ def apply_optimization(
     )
     _write_manifest(mode)
     return mode
+
+
+# --------------------------------------------------------------------------- #
+# 运行门禁：接受 agent 的 ChangeRecord 前，实际跑一次前向，挡住"构造能过、
+# forward 才炸"的算子参数错误（dtype/shape/布局）。
+# --------------------------------------------------------------------------- #
+def _workspace_forward_ok(
+    new_uid: str,
+    base_mode: ExecutionMode,
+    work_dir: Path,
+    record: ChangeRecord,
+) -> bool:
+    """import fork 出的 workspace 并跑一次小前向；能跑通返回 True，否则 False。
+
+    构造一个临时 ExecutionMode 指向 work_dir（change_log 含本次 record），用项目
+    唯一的加载入口 load_build_model 取 (model, tokenizer)，喂一个极短 prompt 跑一次
+    no_grad forward。NPU 自定义/融合算子的参数错误只在 forward 时暴露，构造检查抓不到。
+
+    本函数吞掉一切异常（含 NPU 算子错误）：门禁自身绝不能炸穿 apply。失败时打印
+    原因，方便人工排查。
+    """
+    try:
+        from workspace_loader import load_build_model
+
+        probe = ExecutionMode(
+            uid=new_uid,
+            model_id=base_mode.model_id,
+            strategy_uid=record.strategy_uid,
+            workspace_dir=str(work_dir),
+            parent_uid=base_mode.uid,
+            entrypoint=base_mode.entrypoint,
+            change_log=base_mode.change_log + [record],
+        )
+        model, tokenizer = load_build_model(probe)
+
+        import torch
+
+        device = next(model.parameters()).device
+        input_ids = tokenizer("hello world", return_tensors="pt")["input_ids"].to(device)
+        with torch.no_grad():
+            model(input_ids)
+        # 探针用完即释放，别和后续真实评测在显存里压两份模型。
+        del model
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            torch.npu.empty_cache()
+        elif torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return True
+    except BaseException as exc:  # noqa: BLE001 - 门禁兜住一切，绝不炸穿 apply
+        print(f"[apply] forward gate failed for {new_uid}: {type(exc).__name__}: {exc}")
+        return False
 
 
 def _llm_apply_optimization(

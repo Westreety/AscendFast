@@ -38,8 +38,26 @@ def build_model() -> (model, tokenizer): ...
   重编译的 `graph/*` 等。保持自包含、可运行。
 - 绝不原地修改硬链接的权重文件——它与父 mode 共享 inode。若权重必须改变
   （如量化），写**新文件**并让 `build_model()` 指向它们，保持父 mode 不动。
-- 收尾前先验证 workspace 仍可导入、`build_model()` 能构造出模型
-  （鼓励用一句 `python -c` 做 smoke check）。
+- 收尾前必须验证 `build_model()` 返回的模型能真正**前向跑通**，而不只是能构造。
+  自定义/融合算子（如 `torch_npu.npu_linear`、`npu_*` 系列）的参数错误——dtype、
+  shape、张量布局——**只在 forward 时才暴露**，构造期检查抓不到。用这段 smoke：
+
+  ```bash
+  cd <workspace> && python -c "
+  import torch, build_model as bm
+  m, tok = bm.build_model()
+  ids = tok('hello world', return_tensors='pt')['input_ids'].to(next(m.parameters()).device)
+  with torch.no_grad(): m(ids)
+  print('forward OK')"
+  ```
+
+  它若抛错就先修，**绝不在 forward 跑不通时返回 JSON**。
+- 调 fused op 前先核对它的真实签名与约束，别照搬 `nn.Linear` 的接口。常见坑：
+  `npu_linear(input, weight, bias=None)` 要求 **input 是 2D**——transformer 激活是
+  3D `[B,S,H]`，必须先 `reshape(-1, H)` 再调用、输出 reshape 回去；weight 布局
+  `[out,in]` 与 `nn.Linear` 一致（不要转置）；input/weight dtype 必须一致。
+  拿不准签名就在 workspace 里 `python -c "import torch_npu; print(torch_npu.<op>.__doc__)"`
+  查一下，再用一个小张量单独 probe 该算子能否算通，然后才接进 forward。
 
 ## 输出
 
