@@ -49,15 +49,15 @@ profile 只通过该入口加载，对优化内容本身无知。
 
 ### 1.4 ChangeRecord（单步修改记录）
 
-一次优化动作的自描述记录。优化方案异构（算子融合 / 图改写 / forward patch /
-kvcache / 并行 / 量化 / 尚未想到的方案），但每步都收敛成这条统一记录，供下一轮
-Agent 叠加优化时阅读。
+一次优化动作的自描述记录。优化方案异构，但每步都落在四个 lever 之一
+（forward_patch / operator_fusion / graph_rewrite / loading_time，或尚未归类的
+custom），收敛成这条统一记录，供下一轮 Agent 叠加优化时阅读。
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | mode_uid | str | 引入本次修改的 ExecutionMode.uid |
 | strategy_uid | str | 来源 OptimizationStrategy.uid |
-| kind | str | forward_patch \| operator_fusion \| graph_rewrite \| kvcache \| parallelism \| quantize \| config \| custom |
+| kind | str | forward_patch \| operator_fusion \| graph_rewrite \| loading_time \| custom |
 | summary | str | 一句话：这一步做了什么 |
 | details | str | 详细：动了哪些模块/算子、为什么、有何约束 |
 | files | list[str] | 本步新增/修改文件（相对 workspace_dir） |

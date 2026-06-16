@@ -37,8 +37,9 @@ def build_model() -> (model, tokenizer): ...
 
 你工作完成后，`build_model()` 必须仍然返回一个可运行、数值行为不变（在容差内）
 的模型。correctness/profile **只**通过这个函数加载优化后的模型——它们从不检查你
-的内部产物。所以无论你怎么优化（forward patch、算子融合、重编译图、kvcache 改动、
-权重量化、并行），都要把它接进 `build_model()`，让结果就是从这里返回的模型。
+的内部产物。所以无论你落在哪个 lever（forward_patch、operator_fusion、graph_rewrite、
+loading_time——含静态 KV cache、权重量化等加载期处理），都要把它接进 `build_model()`，
+让结果就是从这里返回的模型。
 
 ## 规则
 
@@ -75,7 +76,7 @@ def build_model() -> (model, tokenizer): ...
 只返回下面这个 JSON 对象——不要 markdown 代码围栏，不要散文：
 
 ```
-{"kind": "forward_patch|operator_fusion|graph_rewrite|kvcache|parallelism|quantize|config|custom",
+{"kind": "forward_patch|operator_fusion|graph_rewrite|loading_time|custom",
  "summary": "<一句话：你做了什么>",
  "details": "<改动的模块/算子、为什么、下一轮需要知道的约束>",
  "files": ["<相对 workspace 的路径>", "..."],

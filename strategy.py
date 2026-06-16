@@ -1,9 +1,12 @@
+# strategy-agent role (WHAT/WHY, names a lever, no code) per [[ADR-0006]]; levers come
+# from the LEVER_KINDS single source of truth ([[ADR-0005]]); raises rather than
+# degrading to an empty list when the agent runtime is unavailable ([[ADR-0008]]).
 from __future__ import annotations
 
 import json
 
 from agent_client import AGENT_ENABLED, call_agent_json
-from models import AnalysisResult, OptimizationStrategy
+from models import LEVER_KINDS, AnalysisResult, OptimizationStrategy
 
 
 def generate_optimization_strategies(
@@ -44,9 +47,16 @@ def _llm_generate_optimization_strategies(
         f"op_type_totals: {json.dumps(analysis.op_type_totals, ensure_ascii=False)}\n"
         f"roofline_summary: {json.dumps(analysis.roofline_summary, ensure_ascii=False)}\n"
         f"profile_findings: {json.dumps(analysis.profile_findings or [], ensure_ascii=False)}\n\n"
+        "Each strategy must name a lever in `kind` (the build_model layer it touches):\n"
+        "  forward_patch   — monkey-patch one nn.Module.forward (narrowest, single op)\n"
+        "  operator_fusion — flip a config flag / attn_implementation to a fused backend\n"
+        "  graph_rewrite   — wrap the whole model (torch.compile / NPU graph mode)\n"
+        "  loading_time    — one-off at load (weight ND→NZ, dtype cleanup, static KV cache, padding)\n"
+        "Do NOT default to forward_patch; across the candidates cover at least two distinct kinds.\n\n"
         "Return JSON:\n"
         '{"strategies": [{"focus": "<bottleneck + target mechanism, one line>", '
         '"measures": ["<mechanism step, describe what, not implementation code>"], '
+        '"kind": "forward_patch|operator_fusion|graph_rewrite|loading_time", '
         '"local_speedup_ratio": 1.1}, ...]}\n'
         "local_speedup_ratio is a conservative estimate, >= 1.0."
     )
@@ -63,14 +73,18 @@ def _llm_generate_optimization_strategies(
             continue
         measures = item.get("measures") if isinstance(item.get("measures"), list) else ["see focus"]
         focus = str(item.get("focus") or "")
-        speedup = _to_float(item.get("local_speedup_ratio")) or 1.05  
+        speedup = _to_float(item.get("local_speedup_ratio")) or 1.05
+        # lever 规范化到 LEVER_KINDS：未指定/未知值默认 forward_patch（最窄、最低风险）。
+        raw_kind = str(item.get("kind") or "").strip()
+        kind = raw_kind if raw_kind in LEVER_KINDS else "forward_patch"
         strategies.append(
             OptimizationStrategy(
                 uid=f"strategy:{analysis.uid}:{len(strategies) + 1}",
                 local_speedup_ratio=round(speedup, 4),
                 measures=measures,
-                prompt_instruction=_build_strategy_prompt(analysis, focus, measures),
+                prompt_instruction=_build_strategy_prompt(analysis, focus, measures, kind),
                 extra={
+                    "kind": kind,
                     "source_analysis_uid": analysis.uid,
                     "model_id": analysis.model_id,
                     "device_kind": analysis.device_kind,
@@ -86,6 +100,7 @@ def _build_strategy_prompt(
     analysis: AnalysisResult,
     focus: str,
     measures: list[str],
+    kind: str,
 ) -> str:
     measures_text = "\n".join(f"- {measure}" for measure in measures)
     top_ops = ", ".join(analysis.top_ops[:10]) if analysis.top_ops else "none"
@@ -95,6 +110,8 @@ def _build_strategy_prompt(
         "concrete API, signature, and guards; decide where to apply the patch and how "
         "to wire build_model; and verify functional equivalence. Preserve correctness "
         "while delivering the targeted latency reduction.\n\n"
+        f"Lever (kind): {kind}\n"
+        f"{_LEVER_HINTS.get(kind, '')}\n\n"
         f"Focus:\n{focus}\n\n"
         f"Measures:\n{measures_text}\n\n"
         "Profile context:\n"
@@ -106,7 +123,21 @@ def _build_strategy_prompt(
         f"- top_ops: {top_ops}\n"
         f"- op_type_totals: {analysis.op_type_totals}\n"
         f"- roofline_summary: {analysis.roofline_summary}\n"
+        f"Report this same kind ({kind}) in your ChangeRecord JSON unless the actual "
+        "change ended up on a different lever.\n"
     )
+
+
+# 每个 lever 给 apply-agent 的落点提示——让它改对位置，而不是默认去 patch forward。
+_LEVER_HINTS = {
+    "forward_patch": "Monkey-patch the target nn.Module.forward from inside build_model().",
+    "operator_fusion": "Set the config flag (e.g. attn_implementation) at load; do not "
+    "hand-patch the attention forward.",
+    "graph_rewrite": "Edit build_model.py inside build_model() (after from_pretrained, "
+    "before return); wrap the whole model. Do not patch any forward.",
+    "loading_time": "Edit build_model.py inside build_model() (after from_pretrained, "
+    "before return); do not patch any forward.",
+}
 
 
 def _to_float(value: object) -> float:

@@ -1,5 +1,8 @@
 """正确性检验：判断一个优化后的 ExecutionMode 输出是否仍与 baseline 等价。
 
+实现 [[ADR-0003]]：每个 fork 都与 baseline 金标准比（非父 mode），指标为 last-token
+logits 余弦相似度，golden 缓存到 baseline workspace。通过 [[RFC-0001]] 入口加载。
+
 定位（与 benchmark.py 对称）：
 - benchmark.py    —— 测一个 mode 跑得**多快**（forward 延迟）。
 - correctness.py  —— 判一个 mode 算得**对不对**（输出与 baseline 是否一致）。
@@ -27,7 +30,7 @@ from apply import _write_manifest
 from dataset import load_prompt_dataset, tokenize_prompts
 from models import ExecutionMode
 from workspace_loader import load_build_model
-from profile_npu import detect_device, _import_torch, _release_device_memory, _run_forward, _synchronize
+from profile_npu import device_spec_for, _import_torch, _release_device_memory, _synchronize
 
 _PROJECT_ROOT = Path(__file__).parent
 # 正确性检验用的固定 prompt 集：与 benchmark 同源真实数据，口径一致。
@@ -150,8 +153,8 @@ def _last_token_logits(
     max_input_tokens: int,
 ) -> Any:
     model, tokenizer = load_build_model(mode)
-    device, _ = detect_device("auto", allow_cpu=True)
-    model = model.to(device.device).eval()
+    device, _ = device_spec_for(model)               # 模型在哪就用哪，不二次搬运
+    model = model.eval()
 
     # 决定性：固定 prompt、固定顺序（不排序），与 golden 一一对应。
     prompts = load_prompt_dataset(ds_path, max_samples=max_samples).prompts
@@ -160,7 +163,7 @@ def _last_token_logits(
     )
 
     with torch.no_grad():
-        out = model(**inputs) if _accepts_kwargs(model, inputs) else _run_forward_capture(model, inputs)
+        out = model(**inputs)
         logits = out.logits if hasattr(out, "logits") else out[0]
     _synchronize(torch, device.kind)
 
@@ -178,15 +181,6 @@ def _last_token_logits(
     del model, out, logits, last
     _release_device_memory(torch, device.kind)
     return result
-
-
-def _accepts_kwargs(model: Any, inputs: dict[str, Any]) -> bool:
-    return "input_ids" in inputs
-
-
-def _run_forward_capture(model: Any, inputs: dict[str, Any]) -> Any:
-    _run_forward(model, inputs)  # 兜底：极少数模型不吃 **inputs
-    return model(**inputs)
 
 
 # --------------------------------------------------------------------------- #

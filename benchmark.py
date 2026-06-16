@@ -1,5 +1,8 @@
 """真实领域数据集上的离线 benchmark：测一个 ExecutionMode 的 forward（prefill）延迟。
 
+实现 [[ADR-0002]] 的「加速比标尺」一侧：用真实 ShareGPT 数据集裸计时（不走 profiler），
+其 mean 延迟是判定 2x 的唯一依据。通过 [[RFC-0001]] 的 build_model() 统一入口加载。
+
 定位（与 profile_runner.run_profile 区分）：
 - run_profile        —— 用模拟数据 + torch_npu profiler 做**诊断**，产 top_kernels 等。
 - run_real_benchmark —— 用真实 ShareGPT 数据集测**纯推理延迟**，作为加速比标尺。
@@ -33,7 +36,7 @@ from dataset import load_prompt_dataset, tokenize_prompts
 from models import ExecutionMode
 from workspace_loader import load_build_model
 from profile_npu import (
-    detect_device,
+    device_spec_for,
     _import_torch,
     _release_device_memory,
     _run_forward,
@@ -86,8 +89,8 @@ def run_real_benchmark(
 
     torch = _import_torch()
     model, tokenizer = load_build_model(mode)
-    device, _ = detect_device("auto", allow_cpu=True)
-    model = model.to(device.device).eval()
+    device, _ = device_spec_for(model)               # 模型在哪就用哪，不二次搬运
+    model = model.eval()
 
     try:
         # 真实 prompt → 按真实 token 长度排序后再 tokenize，减少 batch 内 padding 失真。

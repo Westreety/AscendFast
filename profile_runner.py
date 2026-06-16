@@ -23,7 +23,7 @@ from workspace_loader import load_build_model
 from profile_npu import (
     ProfileConfig,
     build_profile_report,
-    detect_device,
+    device_spec_for,
     profile_model,
     _import_torch,
     _release_device_memory,
@@ -108,8 +108,8 @@ def _deterministic_profile(
 ) -> ProfileResult:
     torch = _import_torch()
     model, tokenizer = load_build_model(mode)
-    device, torch_npu = detect_device("auto", allow_cpu=True)
-    model = model.to(device.device).eval()
+    device, torch_npu = device_spec_for(model)       # 模型在哪就用哪，不二次搬运
+    model = model.eval()
 
     out_dir = Path(mode.workspace_dir) / "profile"
     cfg = ProfileConfig(

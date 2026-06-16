@@ -1,3 +1,7 @@
+# apply (the HOW per [[ADR-0006]]): forks a workspace ([[ADR-0004]]: hardlinked
+# weights), invokes apply-agent to stack one optimization, and runs a forward gate
+# before accepting the ChangeRecord ([[ADR-0008]]). Forks honor the [[RFC-0001]]
+# build_model() entrypoint contract.
 from __future__ import annotations
 
 import json
@@ -8,7 +12,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from agent_client import AGENT_ENABLED, call_agent_json
-from models import ChangeRecord, ExecutionMode, OptimizationStrategy
+from models import CHANGE_KINDS, ChangeRecord, ExecutionMode, OptimizationStrategy
 
 _PROJECT_ROOT = Path(__file__).parent
 _ADAPTATIONS = _PROJECT_ROOT / "adaptations"
@@ -173,21 +177,25 @@ def _llm_apply_optimization(
         "model/ are hardlinked from the parent: if you must mutate weights, write NEW\n"
         "files (do not edit hardlinked ones in place) so the parent stays intact.\n\n"
         "When done, return ONLY this JSON describing what you changed:\n"
-        '{"kind": "forward_patch|operator_fusion|graph_rewrite|kvcache|parallelism|quantize|config|custom",\n'
+        '{"kind": "forward_patch|operator_fusion|graph_rewrite|loading_time|custom",\n'
         ' "summary": "<one sentence: what you did>",\n'
         ' "details": "<modules/operators touched, why, any constraints>",\n'
         ' "files": ["<relative-to-workspace path>", "..."],\n'
         ' "revert_cmd": "<shell cmd to undo, or null>",\n'
         ' "metadata": {}}'
     )
-    result = call_agent_json("apply-agent", prompt, timeout=1000)
+    result = call_agent_json("apply-agent", prompt, timeout=2000)
     if not isinstance(result, dict) or "summary" not in result:
         return None
     files = result.get("files")
+    # kind 规范化到 CHANGE_KINDS：agent 报了陈旧/未知值（如旧枚举里的 kvcache）就
+    # 收敛成 custom，避免脏 kind 流进 manifest 和 ledger 的按-lever 归因。
+    raw_kind = str(result.get("kind") or "custom")
+    kind = raw_kind if raw_kind in CHANGE_KINDS else "custom"
     return ChangeRecord(
         mode_uid=new_uid,
         strategy_uid=strategy.uid,
-        kind=str(result.get("kind") or "custom"),
+        kind=kind,
         summary=str(result.get("summary") or ""),
         details=str(result.get("details") or ""),
         # file->这次修改涉及到哪些文件。
@@ -237,7 +245,6 @@ def _write_manifest(mode: ExecutionMode) -> None:
         "strategy_uid": mode.strategy_uid,
         "parent_uid": mode.parent_uid,
         "entrypoint": mode.entrypoint,
-        # 如果change_log里面有一个None就会崩溃
         "change_log": [asdict(r) for r in mode.change_log],
         "correctness_passed": mode.correctness_passed,
         "extra": mode.extra,

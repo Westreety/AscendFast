@@ -1,12 +1,19 @@
-"""Thin bridge: Python → claude CLI headless agent calls."""
+"""Thin bridge: Python → claude headless agent calls via claude-agent-sdk."""
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
-import subprocess
-import sys
+import shutil
 from pathlib import Path
+
+from claude_agent_sdk import (
+    ClaudeAgentOptions,
+    ClaudeSDKError,
+    ResultMessage,
+    query,
+)
 
 from verify import record_agent_call
 
@@ -15,9 +22,55 @@ AGENT_ENABLED: bool = os.environ.get("ASCENDFAST_USE_LLM_AGENT", "1") != "0"
 
 _PROJECT_ROOT = Path(__file__).parent
 
+# Pin the claude binary so calls don't depend on PATH (the project venv does not
+# expose `claude` itself; it lives in the conda env that ships Claude Code).
+_CLI_PATH = "/root/miniconda3/envs/llm_test/bin/claude"
+
+# SDK process-layer failures all map to the existing "subprocess_error" ledger
+# status — the label predates the SDK migration but its meaning is unchanged:
+# "failed to invoke / talk to the claude CLI process".
+# CLINotFoundError / CLIConnectionError / ProcessError / CLIJSONDecodeError are
+# all subclasses of ClaudeSDKError, so the base class alone covers them.
+_PROCESS_ERRORS = (ClaudeSDKError,)
+
+
+async def _run_agent(agent_name: str, prompt: str) -> str | None:
+    """Drive a single headless agent query; return its final text or None.
+
+    Returns None when the run produced no successful ResultMessage (is_error or
+    subtype != "success"). Raises SDK exceptions on process-layer failures —
+    call_agent maps those to ledger statuses.
+    """
+    opts = ClaudeAgentOptions(
+        cwd=str(_PROJECT_ROOT),
+        permission_mode="acceptEdits",
+        setting_sources=["project"],        # 必须：否则读不到 .claude/agents/*.md
+        extra_args={"agent": agent_name},   # 必须：ClaudeAgentOptions 无 agent 字段，透传 --agent
+        cli_path=_CLI_PATH,
+    )
+    result: ResultMessage | None = None
+    # 显式持有 query() 这个 async generator，并在 finally 里 aclose()。
+    # 为什么不能只写 `async for ... in query(...)`：
+    # SDK 在 generator 内层用 `finally: await transport.close()` 回收它 spawn 的
+    # claude 子进程（SIGTERM→SIGKILL 三级兜底）。但 wait_for 超时取消时，裸 async for
+    # 的 generator 清理依赖 asyncio.run() 退出时的 shutdown_asyncgens() 隐式钩子——
+    # 一旦有人把它跑在持久 event loop 上（不每次 shutdown_asyncgens），那条 finally
+    # 就不保证即时执行，claude 子进程会泄漏成僵尸（长 run 下每次 1000s 超时累积）。
+    # 显式 aclose() 把这份回收从"借 asyncio.run 的隐式钩子"变成我方控制、即时触发。
+    agen = query(prompt=prompt, options=opts)
+    try:
+        async for msg in agen:
+            if isinstance(msg, ResultMessage):
+                result = msg
+    finally:
+        await agen.aclose()
+    if result is None or result.is_error or result.subtype != "success":
+        return None
+    return result.result
+
 
 def call_agent(agent_name: str, prompt: str, *, timeout: int = 120) -> str | None:
-    """Run `claude -p <prompt> --agent <agent_name>` headless; return text or None.
+    """Run a headless `--agent <agent_name>` query via claude-agent-sdk; return text or None.
 
     Before every None return, log an agent_call StageOutcome distinguishing the
     failure kind (disabled/timeout/subprocess_error/agent_error) so "为什么没效果"
@@ -27,37 +80,24 @@ def call_agent(agent_name: str, prompt: str, *, timeout: int = 120) -> str | Non
         record_agent_call(agent_name, "disabled")
         return None
     try:
-        result = subprocess.run(
-            ["claude", "-p", prompt, "--agent", agent_name, "--output-format", "json",
-             "--permission-mode", "acceptEdits"],
-            capture_output=True, text=True, timeout=timeout, cwd=_PROJECT_ROOT,
-        )
-    except subprocess.TimeoutExpired:
+        result = asyncio.run(asyncio.wait_for(_run_agent(agent_name, prompt), timeout))
+    except asyncio.TimeoutError:
         record_agent_call(agent_name, "timeout", f"exceeded {timeout}s")
         return None
-    except Exception as exc:  # noqa: BLE001
+    except _PROCESS_ERRORS as exc:
         record_agent_call(agent_name, "subprocess_error", f"{type(exc).__name__}: {exc}")
         return None
-    #如果 result.stdout 不是合法 JSON，return None
-    try:
-        outer = json.loads(result.stdout)
-    except json.JSONDecodeError: 
-        record_agent_call(agent_name, "agent_error", "stdout was not valid CLI JSON")
+    except Exception as exc:  # noqa: BLE001 - 非进程层异常：多半是 agent_client 自身的 bug
+        record_agent_call(agent_name, "unexpected", f"{type(exc).__name__}: {exc}")
         return None
-    
-    if outer.get("is_error") or outer.get("subtype") != "success":
-        record_agent_call(agent_name, "agent_error", str(outer.get("subtype") or "is_error"))
+    if result is None:
+        record_agent_call(agent_name, "agent_error", "no successful ResultMessage")
         return None
     record_agent_call(agent_name, "ok")
-    # {
-    # "subtype": "success",
-    # "is_error": false,
-    # "result": "agent 返回内容"
-    # }
-    return outer.get("result")
+    return result
 
 
-def call_agent_json(agent_name: str, prompt: str, *, timeout: int = 120) -> dict | list | None:
+def call_agent_json(agent_name: str, prompt: str, *, timeout: int = 1200) -> dict | list | None:
     """Like call_agent but parse .result as JSON; return None on any failure."""
     prompt_with_constraint = (
         prompt + "\n\nIMPORTANT: Reply with ONLY valid JSON, no markdown fences."

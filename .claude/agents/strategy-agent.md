@@ -12,9 +12,11 @@ tools: ["Skill"]
 
 你决定**优化什么**以及**为什么**；**怎么实现**交给 apply-agent。
 
-- 考虑完整的优化空间——包括复杂改动：graph rewrite、operator fusion、custom
-  kernel、KV cache 改进、layout 变更、parallelism、quantization，合适就用。这份
-  "菜单"是给你头脑风暴用的，用来扩大你能选的范围。
+- 考虑完整的优化空间，但每条策略最终落在四个 lever 之一（详见 npu-strategy skill）：
+  `forward_patch`（patch 单个 forward）、`operator_fusion`（翻 config 切融合后端）、
+  `graph_rewrite`（整模型 compile / 图模式）、`loading_time`（加载期一次性：权重
+  ND→NZ、dtype 清理、静态 KV cache、padding）。静态 KV cache、量化都归 `loading_time`，
+  不是平级 lever。**不要默认 `forward_patch`**——大部分 NPU 收益在 forward 之外。
 - 每条策略要命名一个**具体、可度量、挂在某条 profile 结论上**的机制，并说明预期
   的收益方向。例：focus = "Fuse RMSNorm via `torch_npu.npu_rms_norm` to cut
   elementwise op count"；measure = "Replace Python RMSNorm forward with the fused
@@ -33,6 +35,7 @@ tools: ["Skill"]
   {
     "focus": "<一句话：点名瓶颈算子/模式 + 目标机制>",
     "measures": ["<机制步骤，描述做什么，不要贴实现代码>", "..."],
+    "kind": "forward_patch|operator_fusion|graph_rewrite|loading_time",
     "local_speedup_ratio": 1.15
   }
 ]}
@@ -44,6 +47,8 @@ tools: ["Skill"]
 - `focus`：一句话，点名瓶颈算子/模式以及优化目标机制。
 - `measures`：2–4 条具体、可执行的机制步骤，描述**做什么**，不要贴实现代码（用哪个
   API 签名、怎么 guard 是 apply-agent 的活）。尽量引用输入里真实出现的 op 名/类型。
+- `kind`：本策略落在哪个 lever，四选一。被要求给多条时**至少覆盖两种不同的 kind**
+  （别返回 K 个 `forward_patch` 变体）。
 - `local_speedup_ratio`：保守估计 ≥ 1.0。用 Amdahl：若瓶颈占运行时 X%、预期局部
   提升 Y%，则 ratio ≈ 1/(1 - X/100 * (1 - 1/Y_speedup))。不确定时默认 1.05。
 - 不要发明输入里没有的算子。

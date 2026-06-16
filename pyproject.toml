@@ -12,6 +12,7 @@ dependencies = [
     "transformers==4.57.1",
     "accelerate==1.12.0",
     "safetensors==0.7.0",
+    "claude-agent-sdk>=0.2.101",
 ]
 
 [project.optional-dependencies]
@@ -22,11 +23,18 @@ hub = [
 
 [tool.uv]
 index-strategy = "unsafe-best-match"
+# uv 下载/解包缓存放仓库内（默认 /root/.cache/uv，与项目 .venv 往往不同盘，
+# 跨盘时 uv 无法硬链接、退化成复制变慢）。相对路径相对于本文件所在目录解析。
+cache-dir = ".uv-cache"
 
 [tool.uv.sources]
 # torch_npu 只在华为源有；torch 2.7.1 (aarch64) 也走华为源以保证与 torch_npu 同源。
 torch = [{ index = "ascend-repo" }]
 "torch-npu" = [{ index = "ascend-repo" }]
+
+[[tool.uv.index]]
+url = "http://mirrors.aliyun.com/pypi/simple/"
+default = true
 
 [[tool.uv.index]]
 name = "ascend-repo"

@@ -1,4 +1,7 @@
 """verify：把每个环节"已经在做但形态不一"的成败判断，收敛成一个 StageOutcome
+
+实现 [[ADR-0007]] 的可观测层：stage() 吞异常落成 StageOutcome、gate_* 纯函数门禁、
+RunLedger 落盘决策轨迹。gate_apply 与 apply 的运行 forward gate（[[ADR-0008]]）配合。
 + 一个 stage() 机制记录下来；门禁是喂给它的纯函数。
 
 不发明新观测层。这里只做三件事，全部围绕 RunLedger / StageOutcome 两个实体：
@@ -53,7 +56,7 @@ class _Stage:
     自行调 gate_* 并 fail()。异常路径由 __exit__ 兜底成 ok=False。
     """
 
-    __slots__ = ("name", "mode_uid", "ok", "reason", "value")
+    __slots__ = ("name", "mode_uid", "ok", "reason", "value", "metadata")
 
     def __init__(self, name: str, mode_uid: str | None) -> None:
         self.name = name
@@ -61,6 +64,7 @@ class _Stage:
         self.ok = True
         self.reason = ""
         self.value = None
+        self.metadata = None       # 环节体可选填的归因信息，透传进 StageOutcome.metadata
 
     def fail(self, reason: str) -> None:
         self.ok = False
@@ -86,6 +90,7 @@ def stage(ledger: RunLedger | None, name: str, mode_uid: str | None = None):
     finally:
         _record(ledger, StageOutcome(
             stage=st.name, ok=st.ok, reason=st.reason, mode_uid=st.mode_uid,
+            metadata=st.metadata,
         ))
 
 
@@ -119,7 +124,8 @@ def gate_apply(child: ExecutionMode | None, base: ExecutionMode) -> tuple[bool, 
 # --------------------------------------------------------------------------- #
 def record_agent_call(agent_name: str, status: str, detail: str = "") -> None:
     """记一条 agent_call StageOutcome。status: ok|disabled|timeout|subprocess_error|
-    agent_error|bad_json。ok=(status=="ok")；永不抛异常、永不影响调用方的 None 契约。"""
+    unexpected|agent_error|bad_json。ok=(status=="ok")；永不抛异常、永不影响调用方的
+    None 契约。"""
     _record(current_ledger(), StageOutcome(
         stage="agent_call",
         ok=(status == "ok"),

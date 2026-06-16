@@ -595,6 +595,62 @@ def _resolve_dtype(torch: Any, dtype_text: str) -> Any:
     return mapping[key]
 
 
+def _npu_device_spec(torch: Any, index: int, torch_npu: Any) -> tuple[DeviceSpec, Any]:
+    """Build a DeviceSpec for npu:<index>, reading that card's own properties."""
+    props = torch.npu.get_device_properties(index)
+    total_memory = float(getattr(props, "total_memory", 0.0) or 0.0)
+    return (
+        DeviceSpec(
+            kind="npu",
+            device=f"npu:{index}",
+            name=str(torch.npu.get_device_name(index)),
+            count=int(torch.npu.device_count()),
+            memory_gb=round(total_memory / (1024 ** 3), 1) if total_memory else 0.0,
+        ),
+        torch_npu,
+    )
+
+
+def _cuda_device_spec(torch: Any, index: int) -> tuple[DeviceSpec, None]:
+    """Build a DeviceSpec for cuda:<index>, reading that card's own properties."""
+    props = torch.cuda.get_device_properties(index)
+    total_memory = float(getattr(props, "total_memory", 0.0) or 0.0)
+    return (
+        DeviceSpec(
+            kind="cuda",
+            device=f"cuda:{index}",
+            name=str(torch.cuda.get_device_name(index)),
+            count=int(torch.cuda.device_count()),
+            memory_gb=round(total_memory / (1024 ** 3), 1) if total_memory else 0.0,
+        ),
+        None,
+    )
+
+
+def device_spec_for(model: Any) -> tuple[DeviceSpec, Any | None]:
+    """以模型真身所在设备为权威，构造 DeviceSpec —— 不再独立猜测放哪。
+
+    build_model() 已经把模型 .to(device) 了；消费端（correctness/benchmark/profile）
+    应当读模型真实所在的设备，而非再 detect_device("auto") 重新猜一遍——后者在多卡
+    下可能猜到另一张卡，触发静默跨卡搬运，污染 benchmark/profile 数据甚至 OOM。
+
+    这里直接取模型参数所在 device（ground truth），并读该卡自己的属性填充
+    name/memory_gb（不再硬编码 0 号卡）。CPU 模型走 cpu 分支。
+    """
+    torch = _import_torch()
+    dev = next(model.parameters()).device
+    index = dev.index if dev.index is not None else 0
+    if dev.type == "npu":
+        try:
+            import torch_npu as loaded_torch_npu  # type: ignore[import-not-found]
+        except Exception:
+            loaded_torch_npu = None
+        return _npu_device_spec(torch, index, loaded_torch_npu)
+    if dev.type == "cuda":
+        return _cuda_device_spec(torch, index)
+    return DeviceSpec(kind="cpu", device="cpu", name="CPU", count=1), None
+
+
 def detect_device(prefer: str = "auto", *, allow_cpu: bool = False) -> tuple[DeviceSpec, Any | None]:
     """Detect the active profiling device and return optional torch_npu module."""
 
@@ -609,34 +665,12 @@ def detect_device(prefer: str = "auto", *, allow_cpu: bool = False) -> tuple[Dev
         except Exception:
             torch_npu = None
         if torch_npu is not None and hasattr(torch, "npu") and torch.npu.is_available():
-            props = torch.npu.get_device_properties(0)
-            total_memory = float(getattr(props, "total_memory", 0.0) or 0.0)
-            return (
-                DeviceSpec(
-                    kind="npu",
-                    device="npu:0",
-                    name=str(torch.npu.get_device_name(0)),
-                    count=int(torch.npu.device_count()),
-                    memory_gb=round(total_memory / (1024 ** 3), 1) if total_memory else 0.0,
-                ),
-                torch_npu,
-            )
+            return _npu_device_spec(torch, 0, torch_npu)
         if preferred == "npu":
             raise RuntimeError("Requested NPU profiling, but torch_npu/torch.npu is not available.")
 
     if preferred in {"auto", "cuda"} and torch.cuda.is_available():
-        props = torch.cuda.get_device_properties(0)
-        total_memory = float(getattr(props, "total_memory", 0.0) or 0.0)
-        return (
-            DeviceSpec(
-                kind="cuda",
-                device="cuda:0",
-                name=str(torch.cuda.get_device_name(0)),
-                count=int(torch.cuda.device_count()),
-                memory_gb=round(total_memory / (1024 ** 3), 1) if total_memory else 0.0,
-            ),
-            None,
-        )
+        return _cuda_device_spec(torch, 0)
     if preferred == "cuda":
         raise RuntimeError("Requested CUDA profiling, but CUDA is not available.")
 

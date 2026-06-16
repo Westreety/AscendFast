@@ -1,3 +1,6 @@
+# Orchestrator. Implements [[ADR-0001]] (unified recursive node, no first-round
+# special case), [[ADR-0002]] (benchmark latency judges 2x, profile only diagnoses),
+# and [[ADR-0003]] (correctness vs baseline golden, threaded as baseline_mode).
 from __future__ import annotations
 
 import time
@@ -122,6 +125,13 @@ def optimize(
             ok, reason = gate_apply(st.value, base_mode)
             if not ok:
                 st.fail(reason)
+            else:
+                # 按-lever 归因：strategy 想要的 vs apply 实际落的（不加 ledger 字段，
+                # 复用 StageOutcome.metadata）。两者不一致即暴露 strategy↔apply 的偏差。
+                st.metadata = {
+                    "strategy_kind": (strategy.extra or {}).get("kind"),
+                    "applied_kind": st.value.change_log[-1].kind,
+                }
         if not st.ok:
             print(f"{indent}    ❌ apply 失败，跳过")
             continue

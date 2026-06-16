@@ -1,3 +1,5 @@
+# analysis-agent role (WHERE time goes, no fixes) per [[ADR-0006]]; raises instead of
+# silently degrading when the agent runtime is unavailable, per [[ADR-0008]].
 from __future__ import annotations
 
 import json
@@ -233,41 +235,6 @@ def _infer_total_latency_ms(
     return total_device_time
 
 
-def _rule_profile_findings(
-    report: dict[str, Any],
-    op_type_totals: dict[str, dict],
-    latency_stats: dict | None,
-) -> list[str]:
-    hints: list[str] = []
-    matmul_pct = _pct(op_type_totals, "matmul")
-    attention_pct = _pct(op_type_totals, "flash_attention")
-    copy_cast_pct = _pct(op_type_totals, "copy_cast")
-    rmsnorm_pct = _pct(op_type_totals, "rmsnorm")
-    reduce_pct = _pct(op_type_totals, "reduce")
-
-    if matmul_pct >= 35.0:
-        hints.append(
-            f"matmul dominates {matmul_pct:.1f}% of top-kernel time; it is the primary bottleneck."
-        )
-    if attention_pct >= 5.0:
-        hints.append(
-            f"flash_attention accounts for {attention_pct:.1f}% of top-kernel time."
-        )
-    if copy_cast_pct >= 2.0:
-        hints.append(
-            f"copy_cast (dtype/layout conversion) accounts for {copy_cast_pct:.1f}% of top-kernel time."
-        )
-    if rmsnorm_pct + reduce_pct >= 5.0:
-        hints.append(
-            f"normalization/reduce kernels account for {rmsnorm_pct + reduce_pct:.1f}% of top-kernel time."
-        )
-    if latency_stats:
-        noise = _float_or_zero(latency_stats.get("noise_relative"))
-        if noise > 0.05:
-            hints.append(f"latency noise is high ({noise:.2%}); measurements are unreliable for small deltas.")
-    return hints
-
-
 def _llm_profile_findings(
     report: dict[str, Any],
     op_type_totals: dict[str, dict],
@@ -306,20 +273,22 @@ def _profile_findings(
     latency_stats: dict | None,
     roofline_summary: dict[str, float] | None = None,
 ) -> list[str]:
-    if AGENT_ENABLED:
-        hints = _llm_profile_findings(
+    """LLM diagnosis findings (no rule-based fallback).
+
+    Requires the agent runtime to be enabled; raises otherwise so the failure
+    is visible instead of silently degrading to empty findings.
+    """
+    try:
+        if not AGENT_ENABLED:
+            raise RuntimeError(
+                f"analysis agent unavailable: AGENT_ENABLED={AGENT_ENABLED!r}"
+            )
+        return _llm_profile_findings(
             report, op_type_totals, latency_stats, roofline_summary or {}
-        )
-        if hints:
-            return hints
-    return _rule_profile_findings(report, op_type_totals, latency_stats)
-
-
-def _pct(op_type_totals: dict[str, dict], op_type: str) -> float:
-    item = op_type_totals.get(op_type)
-    if not isinstance(item, dict):
-        return 0.0
-    return _float_or_zero(item.get("pct_total"))
+        ) or []
+    except Exception as exc:
+        print(f"[analysis] findings failed (AGENT_ENABLED={AGENT_ENABLED!r}): {exc}")
+        raise
 
 
 def _optional_str(value: Any) -> str | None:

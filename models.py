@@ -1,19 +1,40 @@
+# Data entities. LEVER_KINDS is the single source of truth per [[ADR-0005]];
+# ExecutionMode + ChangeRecord realize the workspace model of [[ADR-0004]] /
+# [[RFC-0001]]; StageOutcome + RunLedger realize the observability layer of [[ADR-0007]].
 from __future__ import annotations
 from dataclasses import dataclass, field
+
+
+# --------------------------------------------------------------------------- #
+# 优化杠杆（lever）的权威枚举——单一真相源。
+# strategy 选 lever、apply 记 kind、ledger 归因都引用这里；新增/改名 lever 只动
+# 这一处，其余 Python 文件 import 本常量，不再各自硬编码字符串（文档侧手工对齐）。
+#
+# 四个 canonical lever 对应 build_model 的四个改动层级（详见 npu-strategy skill）：
+#   forward_patch   — monkey-patch 某个 nn.Module.forward（最窄，治单算子）
+#   operator_fusion — 改 config / attn_implementation，整条路径切融合后端
+#   graph_rewrite   — 在 build_model() 里包整模型（torch.compile / NPU 图模式）
+#   loading_time    — 加载期一次性处理（权重 ND→NZ、dtype 清理、静态 KV cache、padding）
+# kvcache / quantize / config / parallelism 不是平级 lever：前三者都是 loading_time
+# 的子情况，parallelism 单卡 NPU 用不到——不要把它们当独立 kind。
+# --------------------------------------------------------------------------- #
+LEVER_KINDS = ("forward_patch", "operator_fusion", "graph_rewrite", "loading_time")
+# apply 侧合法的 kind 全集：四个 lever + custom（实在无法归类时的兜底，strategy 不用）。
+CHANGE_KINDS = LEVER_KINDS + ("custom",)
 
 
 @dataclass
 class ChangeRecord:
     """一次优化动作的自描述记录，喂给下一轮 Agent 和人阅读。
 
-    优化方案本身是异构的（算子融合 / 图改写 / forward patch / kvcache /
-    并行 / 量化 / 尚未想到的方案），但每一步都收敛成这条统一记录：
-    做了什么（summary/details）、动了哪些文件（files）、怎么回退（revert_cmd）。
+    优化方案本身是异构的（落在四个 lever 之一：forward_patch / operator_fusion /
+    graph_rewrite / loading_time，或尚未归类的 custom），但每一步都收敛成这条统一
+    记录：做了什么（summary/details）、动了哪些文件（files）、怎么回退（revert_cmd）。
     """
     mode_uid: str               # 引入本次修改的 ExecutionMode.uid
     strategy_uid: str           # 来源 OptimizationStrategy.uid
-    kind: str                   # forward_patch | operator_fusion | graph_rewrite
-                                #  | kvcache | parallelism | quantize | config | custom
+    kind: str                   # CHANGE_KINDS 之一：forward_patch | operator_fusion
+                                #  | graph_rewrite | loading_time | custom
     summary: str                # 一句话：这一步做了什么
     details: str                # 详细：动了哪些模块/算子、为什么、有何约束
     files: list[str]            # 本步新增/修改的文件（相对 workspace_dir）

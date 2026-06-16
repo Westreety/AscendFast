@@ -132,8 +132,7 @@ KV cache / 因动态 shape 触发重编译。
 当被要求为同一份 AnalysisResult 给出 top-K 策略时，**不要**返回 K 个
 同一 `forward_patch` 的变体。至少覆盖两种不同的 `kind`——
 例如一条 `forward_patch`（便宜、低风险）加一条 `graph_rewrite` 或
-`loading_time`（上限更高）。把选定的 lever 记进 `extra={"kind": ...}`，
-让 apply-agent 和 ledger 都能看到。
+`loading_time`（上限更高）。
 
 ## 编写 `prompt_instruction`
 
