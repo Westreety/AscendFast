@@ -52,6 +52,12 @@ def _llm_generate_optimization_strategies(
         "  operator_fusion — flip a config flag / attn_implementation to a fused backend\n"
         "  graph_rewrite   — wrap the whole model (torch.compile / NPU graph mode)\n"
         "  loading_time    — one-off at load (weight ND→NZ, dtype cleanup, static KV cache, padding)\n"
+        "Beyond the official torch_npu.npu_* fused ops, a project-local custom operator\n"
+        "library `torch.ops.ascendfast.*` (the kernels/ package) is also available: when a\n"
+        "hot op has NO suitable official fused implementation, you MAY propose replacing it\n"
+        "with a custom AscendC kernel. This is still a forward_patch or operator_fusion lever\n"
+        "(it just swaps in a different op) — say WHAT/WHY only, never the HOW; the apply step\n"
+        "decides whether such a kernel exists or must be written.\n"
         "Do NOT default to forward_patch; across the candidates cover at least two distinct kinds.\n\n"
         "Return JSON:\n"
         '{"strategies": [{"focus": "<bottleneck + target mechanism, one line>", '
