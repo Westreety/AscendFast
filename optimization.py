@@ -9,11 +9,13 @@ from analysis import analyze_profile
 from apply import apply_optimization, ensure_baseline_mode
 from benchmark import run_real_benchmark
 from correctness import run_correctness_test
-from models import ExecutionMode, RunLedger
+from models import ExecutionMode, OperatorSpec, RunLedger
+from operator_gen import generate_operator
 from profile_runner import run_profile
 from strategy import generate_optimization_strategies
 from verify import (
     gate_apply,
+    gate_operator,
     gate_strategy,
     set_current_ledger,
     stage,
@@ -118,10 +120,34 @@ def optimize(
     best_mode, best_lat = base_mode, latency
     for i, strategy in enumerate(strategies[:top_k]):
         print(f"{indent}  ⚙️  apply [{i+1}/{min(len(strategies), top_k)}]: {strategy.uid}")
+
+        # ②.5 自定义算子（可选）：strategy 在 extra.custom_operator 里点名「官方无合适算子、
+        # 想要一个自定义/融合 kernel」时，先请 operator-agent 把它 design+compile+install+
+        # 数值自检出来，产出一个已验证的 OperatorArtifact 传给 apply。算子生成失败 ≠ 策略
+        # 失败：gate 不过就把 artifact 置 None，apply 退回官方/eager 算子继续——kernel 是
+        # 高风险产物，绝不阻断主链。串行执行（算子编译共享 build_out/ 与全局安装路径，
+        # 不可并行），正好嵌在本就串行的策略循环里。
+        operator_artifact = None
+        op_spec = (strategy.extra or {}).get("custom_operator")
+        if op_spec:
+            print(f"{indent}    🔧 generate custom operator: {op_spec.get('op_name')}")
+            with stage(ledger, "operator", base_mode.uid) as st:
+                st.value = generate_operator(
+                    OperatorSpec(**op_spec), strategy, analysis, base_mode
+                )
+                ok, reason = gate_operator(st.value)
+                if not ok:
+                    st.fail(reason)
+            if st.ok:
+                operator_artifact = st.value
+                print(f"{indent}    ✅ custom op ready: {operator_artifact.qualified_name}")
+            else:
+                print(f"{indent}    ⚠️  custom op unavailable ({st.reason}); apply falls back to official op")
+
         # apply：fork + agent 叠加优化。gate_apply 拦下 None-record（agent 失败），
         # 这次没产出可叠加的优化就跳过，不再递归进一个"没真改"的 mode。
         with stage(ledger, "apply", base_mode.uid) as st:
-            st.value = apply_optimization(strategy, base_mode)
+            st.value = apply_optimization(strategy, base_mode, operator_artifact)
             ok, reason = gate_apply(st.value, base_mode)
             if not ok:
                 st.fail(reason)
@@ -131,6 +157,7 @@ def optimize(
                 st.metadata = {
                     "strategy_kind": (strategy.extra or {}).get("kind"),
                     "applied_kind": st.value.change_log[-1].kind,
+                    "custom_op": operator_artifact.qualified_name if operator_artifact else None,
                 }
         if not st.ok:
             print(f"{indent}    ❌ apply 失败，跳过")
@@ -179,6 +206,7 @@ def run(
     baseline = ensure_baseline_mode(model_id, model_dir)
     baseline.correctness_passed = True      # 原始模型按定义正确
 
+    # 一次优化 run 只会有一个 ledger
     ledger = RunLedger(run_uid=f"run:{model_id}:{int(time.time())}", model_id=model_id)
     set_current_ledger(ledger)
     try:

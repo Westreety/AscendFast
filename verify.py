@@ -26,7 +26,7 @@ import json
 from contextlib import contextmanager
 from pathlib import Path
 
-from models import ExecutionMode, OptimizationStrategy, RunLedger, StageOutcome
+from models import ExecutionMode, OperatorArtifact, OptimizationStrategy, RunLedger, StageOutcome
 
 _LEDGER_NAME = "run_ledger.json"
 _PROJECT_ROOT = Path(__file__).parent
@@ -101,6 +101,29 @@ def gate_strategy(strategies: list[OptimizationStrategy] | None) -> tuple[bool, 
     """策略列表非空门禁。空列表此前会让 optimize 的 for 循环静默零次执行。"""
     if not strategies:
         return False, "strategy agent produced no candidates"
+    return True, ""
+
+
+# 数值自检阈值：与 operator.py 保持一致(fp16 舍入噪声约 2e-3 相对，留舒适余量)。
+_OPERATOR_REL_ERR_MAX = 5e-2
+
+
+def gate_operator(artifact: "OperatorArtifact | None") -> tuple[bool, str]:
+    """自定义算子门禁：operator-agent 产出的算子是否真可用。
+
+    与 gate_strategy/gate_apply 同为纯函数门禁。算子缺席本身是允许的降级(调用方据此把
+    artifact 置 None、apply 退回官方算子)，所以这里 ok=False 不代表 run 失败，只代表
+    「这个自定义算子不可用、别当成已验证算子喂给 apply」。三关：拿到 artifact 了吗、
+    声称装上了吗、数值自检过关吗。"""
+    if artifact is None:
+        return False, "operator agent produced no artifact"
+    if not artifact.installed:
+        return False, "operator not installed (compile/install/register failed)"
+    err = artifact.numeric_max_rel_err
+    if err is None:
+        return False, "operator missing numeric self-check result"
+    if err > _OPERATOR_REL_ERR_MAX:
+        return False, f"operator numeric error too large: {err:.4g} > {_OPERATOR_REL_ERR_MAX:.4g}"
     return True, ""
 
 

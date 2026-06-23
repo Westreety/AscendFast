@@ -36,19 +36,32 @@ def _torch_npu_dir() -> Path:
     return Path(torch_npu.__file__).resolve().parent
 
 
+def _adapter_op_name(src: Path) -> str:
+    """adapter_<op>.cpp -> <op>。算子名同时用于 .so 名和 aclnn 头名。"""
+    return src.stem[len("adapter_"):]
+
+
+def _aclnn_header_name(op: str) -> str:
+    """<op> -> aclnn_<op>.h。autogen 的 aclnn 头按算子名（小写下划线）命名。"""
+    return f"aclnn_{op}.h"
+
+
 def build():
-    from torch.utils.cpp_extension import load
+    from torch.utils.cpp_extension import load, _get_build_directory
+    import shutil
 
     cann = _cann_home()
     tnpu = _torch_npu_dir()
 
-    # 工程 build.sh 的产物布局:aclnn 头在 autogen/,host 库在 op_host/。
-    aclnn_inc = _OPS_BUILD / "autogen"                 # aclnn_add_demo.h
-    opapi_lib = _OPS_BUILD / "op_host"                 # libcust_opapi.so
-    for p in (aclnn_inc / "aclnn_add_demo.h", opapi_lib / "libcust_opapi.so"):
-        if not p.exists():
-            raise RuntimeError(f"缺少算子产物：{p}（先在 ascendfast_custom_ops/ 下 build.sh）")
-    # __CONTINUE_HERE__
+    # 工程 build.sh 的产物布局:aclnn 头在 autogen/,host 库（所有算子共用一份
+    # libcust_opapi.so）在 op_host/。
+    aclnn_inc = _OPS_BUILD / "autogen"
+    opapi_lib = _OPS_BUILD / "op_host"
+    if not (opapi_lib / "libcust_opapi.so").exists():
+        raise RuntimeError(
+            f"缺少算子 host 库：{opapi_lib / 'libcust_opapi.so'}"
+            f"（先在 ascendfast_custom_ops/ 下 build.sh）"
+        )
 
     include_dirs = [
         str(tnpu / "include"),
@@ -62,44 +75,55 @@ def build():
         str(cann / "lib64"),
         str(opapi_lib),
     ]
-    # cust_opapi: 本地算子的 host 入口（aclnnAddDemo*）。
+    # cust_opapi: 本地算子的 host 入口（aclnn<Op>*，整个工程一份）。
     # ascendcl/nnopbase: aclCreateTensor / aclnn 执行器底座。
     # torch_npu: getCurrentNPUStream / NPUWorkspaceAllocator。
     libraries = ["torch_npu", "cust_opapi", "ascendcl", "nnopbase"]
 
-    # 编译并安装到 ascendfast_ops/lib/ 目录
     lib_dir = _HERE.parent / "src" / "ascendfast_ops" / "lib"
     lib_dir.mkdir(exist_ok=True)
 
-    # is_python_module=False：adapter 不是 Python 模块（没有 PYBIND11_MODULE），
-    # 只靠 TORCH_LIBRARY 在加载时注册算子。这样 load 不会去找 PyInit_ 函数。
-    # 此模式下 load 返回 None，编译产物 .so 落在 torch 的扩展缓存目录里。
-    load(
-        name="ascendfast_adapter_add_demo",
-        sources=[str(_HERE / "adapter_add_demo.cpp")],
-        extra_include_paths=include_dirs,
-        extra_ldflags=(
-            [f"-L{d}" for d in library_dirs]
-            + [f"-Wl,-rpath,{d}" for d in library_dirs]
-            + [f"-l{l}" for l in libraries]
-        ),
-        is_python_module=False,
-        verbose=True,
-    )
+    # 遍历 csrc/adapter_*.cpp，每个算子各编一个 .so。加新算子只要丢一个
+    # adapter_<op>.cpp 进来（且 B 链已编出对应 aclnn_<op>.h），这里无需改动。
+    adapters = sorted(_HERE.glob("adapter_*.cpp"))
+    if not adapters:
+        raise RuntimeError(f"未找到任何 adapter_*.cpp（在 {_HERE}）")
 
-    # 定位 load 编出的 .so（缓存目录: <ext_root>/<name>/<name>.so）。
-    from torch.utils.cpp_extension import _get_build_directory
-    build_dir = Path(_get_build_directory("ascendfast_adapter_add_demo", verbose=False))
-    so_path = build_dir / "ascendfast_adapter_add_demo.so"
-    if not so_path.exists():
-        raise RuntimeError(f"编译产物未找到: {so_path}")
+    targets = []
+    for src in adapters:
+        op = _adapter_op_name(src)
+        header = aclnn_inc / _aclnn_header_name(op)
+        if not header.exists():
+            raise RuntimeError(
+                f"缺少算子 {op} 的 aclnn 头：{header}"
+                f"（先在 ascendfast_custom_ops/ 下 build.sh 生成它）"
+            )
+        name = f"ascendfast_adapter_{op}"
+        # is_python_module=False：adapter 不是 Python 模块（没有 PYBIND11_MODULE），
+        # 只靠 TORCH_LIBRARY/_FRAGMENT 在加载时注册算子。load 返回 None，产物 .so 落在
+        # torch 的扩展缓存目录里。
+        load(
+            name=name,
+            sources=[str(src)],
+            extra_include_paths=include_dirs,
+            extra_ldflags=(
+                [f"-L{d}" for d in library_dirs]
+                + [f"-Wl,-rpath,{d}" for d in library_dirs]
+                + [f"-l{l}" for l in libraries]
+            ),
+            is_python_module=False,
+            verbose=True,
+        )
+        build_dir = Path(_get_build_directory(name, verbose=False))
+        so_path = build_dir / f"{name}.so"
+        if not so_path.exists():
+            raise RuntimeError(f"编译产物未找到: {so_path}")
+        target = lib_dir / so_path.name
+        shutil.copy2(so_path, target)
+        print(f"[build_adapter] built and installed: {target}")
+        targets.append(target)
 
-    # 复制编译好的 .so 到 lib/ 目录（import ascendfast_ops 时从这里加载）。
-    import shutil
-    target = lib_dir / so_path.name
-    shutil.copy2(so_path, target)
-    print(f"[build_adapter] built and installed: {target}")
-    return target
+    return targets
 
 
 if __name__ == "__main__":

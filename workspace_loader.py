@@ -50,10 +50,13 @@ def load_build_model(mode: ExecutionMode) -> tuple[Any, Any]:
     # modules 相当于是一个文件夹里的文件
     modules_before = set(sys.modules)
     try:
+        # 造出这张 ModuleSpec "说明书"(就是你现在看到的对象)
         spec = importlib.util.spec_from_file_location(f"_mode_entry_{ws.name}", entry)
         if spec is None or spec.loader is None:
             raise ImportError(f"cannot load entrypoint: {entry}")
+        # 照说明书造一个空模块盒子
         module = importlib.util.module_from_spec(spec)
+        # 用说明书里的 loader 执行文件,装进盒子
         spec.loader.exec_module(module)
         
         if not hasattr(module, "build_model"):

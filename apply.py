@@ -12,7 +12,13 @@ from dataclasses import asdict
 from pathlib import Path
 
 from agent_client import AGENT_ENABLED, call_agent_json
-from models import CHANGE_KINDS, ChangeRecord, ExecutionMode, OptimizationStrategy
+from models import (
+    CHANGE_KINDS,
+    ChangeRecord,
+    ExecutionMode,
+    OperatorArtifact,
+    OptimizationStrategy,
+)
 
 _PROJECT_ROOT = Path(__file__).parent
 _ADAPTATIONS = _PROJECT_ROOT / "adaptations"
@@ -62,6 +68,7 @@ def ensure_baseline_mode(model_id: str, model_dir: str | Path) -> ExecutionMode:
 def apply_optimization(
     strategy: OptimizationStrategy,
     base_mode: ExecutionMode,
+    operator_artifact: OperatorArtifact | None = None,
 ) -> ExecutionMode:
     """在 base_mode 的快照之上叠加 strategy，返回新的 ExecutionMode。
 
@@ -70,6 +77,11 @@ def apply_optimization(
       2. 把 base_mode.change_log 注入 prompt，要求 Agent 在已有优化之上叠加。
       3. Agent 原地修改 work_dir，保证 build_model() 仍可运行。
       4. 读回 Agent 报告，追加一条 ChangeRecord，写 manifest。
+
+    operator_artifact（可选）：operator-agent 已经为本策略生成并验证过的自定义算子
+    （torch.ops.ascendfast.<op>）。非 None 时注入 apply-agent 的 prompt，让它直接接入这个
+    已验证算子（保留官方/eager fallback）而不是从头找算子；None 时 apply-agent 走原路径
+    （官方 npu_* 或 eager）。算子缺席只是降级，不改变 apply 的契约。
     """
     new_uid = f"mode:{base_mode.model_id}:{_short_id(strategy.uid)}:{int(time.time())}"
     safe_dir = new_uid.replace(":", "_").replace("/", "_")
@@ -78,7 +90,9 @@ def apply_optimization(
 
     record: ChangeRecord | None = None
     if AGENT_ENABLED:
-        record = _llm_apply_optimization(strategy, base_mode, new_uid, work_dir)
+        record = _llm_apply_optimization(
+            strategy, base_mode, new_uid, work_dir, operator_artifact
+        )
 
     # 运行门禁：agent 说自己改完了，但融合/自定义算子的参数错误（dtype/shape/布局）
     # 只在 forward 时才炸——构造能过、前向才挂。这里在接受这条 record 之前实际跑一次
@@ -161,12 +175,15 @@ def _llm_apply_optimization(
     base_mode: ExecutionMode,
     new_uid: str,
     work_dir: Path,
+    operator_artifact: OperatorArtifact | None = None,
 ) -> ChangeRecord | None:
     prior = _format_change_log(base_mode.change_log)
+    operator_block = _format_operator_artifact(operator_artifact)
     prompt = (
         f"{strategy.prompt_instruction}\n\n"
         "## Already-applied optimizations (DO NOT undo or duplicate these)\n"
         f"{prior}\n\n"
+        f"{operator_block}"
         "## Your workspace\n"
         f"Workspace directory (absolute, already forked from the parent mode): {work_dir}\n"
         f"Entrypoint contract: `{work_dir / _ENTRYPOINT}` MUST keep exposing\n"
@@ -266,6 +283,33 @@ def _load_mode(work_dir: Path) -> ExecutionMode:
         change_log=change_log,
         correctness_passed=data.get("correctness_passed"),
         extra=data.get("extra"),
+    )
+
+
+def _format_operator_artifact(artifact: OperatorArtifact | None) -> str:
+    """把已验证的自定义算子渲染进 apply-agent 的 prompt（None 时返回空串）。
+
+    artifact 到这之前已过 gate_operator（installed + 数值过关），所以这里告诉
+    apply-agent：这个算子「已验证、可直接用」，优先接它、保留官方/eager fallback。
+    """
+    if artifact is None:
+        return ""
+    dtypes = ", ".join(artifact.supported_dtypes) or "unknown"
+    err = (f"{artifact.numeric_max_rel_err:.4g}"
+           if artifact.numeric_max_rel_err is not None else "n/a")
+    return (
+        "## Pre-built custom operator (already compiled, installed, and numerically verified)\n"
+        "An operator-agent has ALREADY built a custom AscendC kernel for this strategy and\n"
+        "registered it. You do NOT build kernels — just WIRE this op into build_model().\n"
+        f"- call it as: {artifact.qualified_name}\n"
+        f"- signature: {artifact.signature}\n"
+        f"- supported dtypes: {dtypes}\n"
+        f"- verified max rel err vs fp32 ref: {err}\n"
+        f"- usage note: {artifact.usage_note}\n"
+        "How to use: `import ascendfast_ops` INSIDE build_model()/a patch function (never at\n"
+        "module top level — workspace isolation), then call the op above. ALWAYS keep a\n"
+        "fallback: probe the op once on a tiny tensor; if import/probe fails, fall back to the\n"
+        "official torch_npu op or eager. Prefer this verified custom op as the primary path.\n\n"
     )
 
 

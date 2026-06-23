@@ -84,6 +84,56 @@ class OptimizationStrategy:
     extra: dict | None = None
 
 
+# --------------------------------------------------------------------------- #
+# 自定义算子的请求/产物：坐在 strategy 与 apply 之间，由 operator-agent 消费/产出。
+#
+# 拆分动机：apply-agent 的 HOW 其实混了两种性质迥异的事——「写 AscendC kernel +
+# 编译 + 装进 CANN」(分钟级、要编译、改全局)和「把算子接进 build_model()」(秒级、
+# 只动 workspace)。OperatorSpec/Artifact 把前者从 apply 里剥出来交给 operator-agent：
+# strategy 只在判断「官方无合适融合算子」时给一个 spec(WHAT/WHY)，operator-agent 据
+# 此产出一个已注册、已数值自检的 torch.ops.ascendfast.<op>，apply 像消费官方 npu_*
+# 一样消费这个 artifact。operator 生成失败 ≠ strategy 失败：artifact 缺省为 None，
+# apply 退回官方/eager 算子，绝不阻断主链。
+# --------------------------------------------------------------------------- #
+@dataclass
+class OperatorSpec:
+    """strategy → operator-agent 的请求：要一个什么样的自定义算子，及为什么官方不够。
+
+    WHAT/WHY 级别，不含 kernel 实现细节(那是 operator-agent 的 HOW)。arch_params 是
+    从本模型架构(workspace 的 model/config.json)抽出的特化参数(hidden_size /
+    num_heads / head_dim / dtype / eps ...)，让 operator-agent 能为「本模型」而非
+    「通用情况」特化 kernel——这正是自定义算子相对官方通用算子的价值来源。
+    """
+    op_name: str                        # 期望的算子名(下划线小写，如 rms_norm_residual)，
+                                        #  最终注册为 torch.ops.ascendfast.<op_name>
+    semantic: str                       # 算子数学语义(一句话/伪代码)，operator-agent 据此写 kernel
+    why_custom: str                     # 为什么官方 torch_npu 没有合适实现(融合点/特化点)
+    fusion_targets: list[str] = field(default_factory=list)  # 想融进一个 kernel 的算子序列
+    arch_params: dict = field(default_factory=dict)          # 本模型架构特化参数
+    expected_signature: str | None = None                    # 期望调用签名(自然语言/伪签名)
+    source_strategy_uid: str | None = None
+    source_analysis_uid: str | None = None
+
+
+@dataclass
+class OperatorArtifact:
+    """operator-agent → apply 的产物：一个已注册、已数值自检的 torch.ops.ascendfast.<op>。
+
+    apply-agent 拿到它就像拿到一个「已知签名、已验证」的算子，把它接进 build_model()
+    即可(并保留官方/eager fallback)。installed=False 或数值不过关时，optimization 的
+    gate_operator 会拦下、artifact 不传给 apply，apply 退回官方算子。
+    """
+    op_name: str                        # 算子名(同 OperatorSpec.op_name)
+    qualified_name: str                 # 完整调用名，如 "torch.ops.ascendfast.rms_norm_residual"
+    signature: str                      # 实际调用签名，如 "rms_norm_residual(x, residual, gamma, eps) -> (y, new_residual)"
+    installed: bool = False             # B链.run 已装 + A链.so 已编 + import 后 op 真实存在
+    supported_dtypes: list[str] = field(default_factory=list)   # 如 ["float16", "float32"]
+    numeric_max_rel_err: float | None = None    # 对 fp32 参考的最大相对误差(数值自检结果)
+    usage_note: str = ""                # 给 apply-agent 的接入提示(形状约束、reshape、返回 tuple 等)
+    files: list[str] = field(default_factory=list)              # kernels/ 下新增/改动的文件
+    metadata: dict | None = None
+
+
 @dataclass
 class AnalysisResult:
     uid: str

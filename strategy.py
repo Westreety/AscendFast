@@ -58,13 +58,24 @@ def _llm_generate_optimization_strategies(
         "with a custom AscendC kernel. This is still a forward_patch or operator_fusion lever\n"
         "(it just swaps in a different op) — say WHAT/WHY only, never the HOW; the apply step\n"
         "decides whether such a kernel exists or must be written.\n"
+        "When (and ONLY when) a custom kernel is genuinely warranted — the official op is\n"
+        "missing OR a multi-op fusion the official library does not offer (e.g. RMSNorm+residual,\n"
+        "RoPE+attention, QKV+bias) would cut launch/cast overhead — attach a `custom_operator`\n"
+        "spec to that strategy. Do NOT attach one when an official fused op already covers the\n"
+        "hot op well (a hand-written kernel rarely beats a tuned official single-op kernel).\n"
+        "The spec is WHAT/WHY for an operator-agent that will design+compile+verify the kernel\n"
+        "BEFORE apply runs; the operator-agent reads the model's own config for arch params.\n"
         "Do NOT default to forward_patch; across the candidates cover at least two distinct kinds.\n\n"
         "Return JSON:\n"
         '{"strategies": [{"focus": "<bottleneck + target mechanism, one line>", '
         '"measures": ["<mechanism step, describe what, not implementation code>"], '
         '"kind": "forward_patch|operator_fusion|graph_rewrite|loading_time", '
-        '"local_speedup_ratio": 1.1}, ...]}\n'
-        "local_speedup_ratio is a conservative estimate, >= 1.0."
+        '"local_speedup_ratio": 1.1, '
+        '"custom_operator": {"op_name": "<snake_case>", "semantic": "<math/pseudocode>", '
+        '"why_custom": "<why official torch_npu is insufficient>", '
+        '"fusion_targets": ["<op>", "..."], "expected_signature": "<optional>"}}, ...]}\n'
+        "local_speedup_ratio is a conservative estimate, >= 1.0. "
+        "OMIT the custom_operator key entirely on strategies that don't need a custom kernel."
     )
     result = call_agent_json("strategy-agent", prompt, timeout=1000)
     if not isinstance(result, dict):
@@ -83,6 +94,11 @@ def _llm_generate_optimization_strategies(
         # lever 规范化到 LEVER_KINDS：未指定/未知值默认 forward_patch（最窄、最低风险）。
         raw_kind = str(item.get("kind") or "").strip()
         kind = raw_kind if raw_kind in LEVER_KINDS else "forward_patch"
+        # 可选 custom_operator spec：仅在 agent 判断「官方无合适算子」时附带。规范化成
+        # 一个干净 dict 存进 extra；optimization 据它决定要不要先跑 operator stage。
+        custom_op = _normalize_custom_operator(
+            item.get("custom_operator"), analysis, f"strategy:{analysis.uid}:{len(strategies) + 1}"
+        )
         strategies.append(
             OptimizationStrategy(
                 uid=f"strategy:{analysis.uid}:{len(strategies) + 1}",
@@ -96,10 +112,41 @@ def _llm_generate_optimization_strategies(
                     "device_kind": analysis.device_kind,
                     "device_name": analysis.device_name,
                     "dtype": analysis.dtype,
+                    "custom_operator": custom_op,   # None 或一个 spec dict
                 },
             )
         )
     return strategies if strategies else None
+
+
+def _normalize_custom_operator(
+    raw: object,
+    analysis: AnalysisResult,
+    strategy_uid: str,
+) -> dict | None:
+    """把 agent 给的 custom_operator 字段规范化成一个干净 spec dict（缺/坏则 None）。
+
+    存的是 dict 而非 OperatorSpec 实例，让 OptimizationStrategy.extra 保持可 JSON 序列化
+    （manifest/ledger 落盘）；optimization 在要用时再 OperatorSpec(**spec) 物化。op_name
+    与 semantic 是底线，缺任一就当没提（返回 None，走官方算子路径）。
+    """
+    if not isinstance(raw, dict):
+        return None
+    op_name = str(raw.get("op_name") or "").strip()
+    semantic = str(raw.get("semantic") or "").strip()
+    if not op_name or not semantic:
+        return None
+    fusion = raw.get("fusion_targets")
+    return {
+        "op_name": op_name,
+        "semantic": semantic,
+        "why_custom": str(raw.get("why_custom") or "").strip(),
+        "fusion_targets": [str(t) for t in fusion] if isinstance(fusion, list) else [],
+        "expected_signature": (str(raw["expected_signature"]).strip()
+                               if raw.get("expected_signature") else None),
+        "source_strategy_uid": strategy_uid,
+        "source_analysis_uid": analysis.uid,
+    }
 
 
 def _build_strategy_prompt(

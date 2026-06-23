@@ -65,7 +65,7 @@ def run_real_benchmark(
     """用真实数据集测 mode 的 forward 端到端平均延迟（ms）。
 
     Args:
-        mode:             已通过正确性测试的执行模式（correctness_passed=True）。
+        mode:             已性通过正确测试的执行模式（correctness_passed=True）。
         dataset_path:     真实领域数据集 jsonl；None 时用默认 ShareGPT 转出文件。
         max_samples:      取数据集前 N 条 prompt 作为一个 batch。
         max_input_tokens: tokenize 的 max_length / padding 上限（prefill 序列长度）。
