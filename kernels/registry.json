@@ -1,0 +1,21 @@
+{
+  "_comment": "已生成的自定义算子清单。operator-agent 写完一个新算子并数值自检通过后，往 operators 里追加一条；下次同名 spec 再来，operator.py 读到这里 installed=true 且数值过关就直接复用、跳过几分钟的重编。键 op_name 唯一。numeric_max_rel_err 是对 fp32 参考的最大相对误差。",
+  "operators": [
+    {
+      "op_name": "rms_norm",
+      "qualified_name": "torch.ops.ascendfast.rms_norm",
+      "signature": "rms_norm(Tensor x, Tensor gamma, float eps) -> Tensor",
+      "installed": true,
+      "supported_dtypes": ["float16", "float32"],
+      "numeric_max_rel_err": 0.0085,
+      "usage_note": "按最后一维(hidden)规约，gamma 沿 [H] 广播，内部 fp32 累加，返回输入 dtype。任意 [..., H] 形状(adapter 内部展平为行)。语义等价 Qwen2RMSNorm，但 benchmark 显示比官方 npu_rms_norm 略慢(0.96x)——RMSNorm 这种官方已高度优化的单算子不是自定义算子的优势场景。",
+      "files": [
+        "kernels/ascendc_ops/ascendfast_custom_ops/ops.json",
+        "kernels/ascendc_ops/ascendfast_custom_ops/op_host/rms_norm_custom.cpp",
+        "kernels/ascendc_ops/ascendfast_custom_ops/op_host/rms_norm_custom_tiling.h",
+        "kernels/ascendc_ops/ascendfast_custom_ops/op_kernel/rms_norm_custom.cpp",
+        "kernels/csrc/adapter_rms_norm_custom.cpp"
+      ]
+    }
+  ]
+}

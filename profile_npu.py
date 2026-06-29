@@ -13,7 +13,6 @@ import importlib
 import importlib.util
 import inspect
 import json
-import math
 import os
 import re
 import sys
@@ -25,6 +24,17 @@ from pathlib import Path
 from typing import Any
 
 from dataset import load_prompt_dataset, load_tokenizer, tokenize_prompts
+
+# 设备运行时工具已抽到 device_utils（profile/benchmark/correctness 三方共用的公共 API）。
+from device_utils import (
+    DeviceSpec,
+    detect_device,
+    device_spec_for,
+    import_torch,
+    release_device_memory,
+    run_forward,
+    synchronize,
+)
 
 
 _STDLIB_PROFILE_MODULE: Any | None = None
@@ -170,17 +180,6 @@ class ProfileCommand:
 
     def shell_display(self) -> str:
         return " ".join(self.argv)
-
-
-@dataclass(frozen=True)
-class DeviceSpec:
-    kind: str
-    device: str
-    name: str
-    count: int = 1
-    memory_gb: float = 0.0
-    peak_tflops_fp16: float = 0.0
-    peak_bandwidth_gb_s: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -549,35 +548,6 @@ def _parse_input_shape(text: str) -> tuple[int, ...]:
     return values
 
 
-def _import_torch() -> Any:
-    _ensure_stdlib_profile_module()
-    os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
-    try:
-        import torch
-    except ImportError as exc:  # pragma: no cover - depends on host env
-        raise RuntimeError("PyTorch is required to capture a profile. Install the ascend or cuda extra first.") from exc
-    return torch
-
-
-def _ensure_stdlib_profile_module() -> None:
-    """Ensure torch_npu sees the stdlib profile module."""
-
-    current = sys.modules.get("profile")
-    current_file = Path(getattr(current, "__file__", "")) if current is not None else None
-    stdlib_dir = Path(sysconfig.get_path("stdlib") or "")
-    stdlib_profile = stdlib_dir / "profile.py"
-    if current_file is not None and current_file == stdlib_profile:
-        return
-    if not stdlib_profile.exists():  # pragma: no cover - defensive for unusual Python builds
-        return
-    spec = importlib.util.spec_from_file_location("profile", stdlib_profile)
-    if spec is None or spec.loader is None:  # pragma: no cover - defensive
-        return
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["profile"] = module
-    spec.loader.exec_module(module)
-
-
 def _resolve_dtype(torch: Any, dtype_text: str) -> Any:
     mapping = {
         "float16": torch.float16,
@@ -593,113 +563,6 @@ def _resolve_dtype(torch: Any, dtype_text: str) -> Any:
     if key not in mapping:
         raise ValueError(f"Unsupported dtype '{dtype_text}'. Supported: {', '.join(sorted(mapping))}")
     return mapping[key]
-
-
-def _npu_device_spec(torch: Any, index: int, torch_npu: Any) -> tuple[DeviceSpec, Any]:
-    """Build a DeviceSpec for npu:<index>, reading that card's own properties."""
-    props = torch.npu.get_device_properties(index)
-    total_memory = float(getattr(props, "total_memory", 0.0) or 0.0)
-    return (
-        DeviceSpec(
-            kind="npu",
-            device=f"npu:{index}",
-            name=str(torch.npu.get_device_name(index)),
-            count=int(torch.npu.device_count()),
-            memory_gb=round(total_memory / (1024 ** 3), 1) if total_memory else 0.0,
-        ),
-        torch_npu,
-    )
-
-
-def _cuda_device_spec(torch: Any, index: int) -> tuple[DeviceSpec, None]:
-    """Build a DeviceSpec for cuda:<index>, reading that card's own properties."""
-    props = torch.cuda.get_device_properties(index)
-    total_memory = float(getattr(props, "total_memory", 0.0) or 0.0)
-    return (
-        DeviceSpec(
-            kind="cuda",
-            device=f"cuda:{index}",
-            name=str(torch.cuda.get_device_name(index)),
-            count=int(torch.cuda.device_count()),
-            memory_gb=round(total_memory / (1024 ** 3), 1) if total_memory else 0.0,
-        ),
-        None,
-    )
-
-
-def device_spec_for(model: Any) -> tuple[DeviceSpec, Any | None]:
-    """以模型真身所在设备为权威，构造 DeviceSpec —— 不再独立猜测放哪。
-
-    build_model() 已经把模型 .to(device) 了；消费端（correctness/benchmark/profile）
-    应当读模型真实所在的设备，而非再 detect_device("auto") 重新猜一遍——后者在多卡
-    下可能猜到另一张卡，触发静默跨卡搬运，污染 benchmark/profile 数据甚至 OOM。
-
-    这里直接取模型参数所在 device（ground truth），并读该卡自己的属性填充
-    name/memory_gb（不再硬编码 0 号卡）。CPU 模型走 cpu 分支。
-    """
-    torch = _import_torch()
-    dev = next(model.parameters()).device
-    index = dev.index if dev.index is not None else 0
-    if dev.type == "npu":
-        try:
-            import torch_npu as loaded_torch_npu  # type: ignore[import-not-found]
-        except Exception:
-            loaded_torch_npu = None
-        return _npu_device_spec(torch, index, loaded_torch_npu)
-    if dev.type == "cuda":
-        return _cuda_device_spec(torch, index)
-    return DeviceSpec(kind="cpu", device="cpu", name="CPU", count=1), None
-
-
-def detect_device(prefer: str = "auto", *, allow_cpu: bool = False) -> tuple[DeviceSpec, Any | None]:
-    """Detect the active profiling device and return optional torch_npu module."""
-
-    torch = _import_torch()
-    preferred = prefer.lower().strip()
-    torch_npu = None
-    if preferred in {"auto", "npu"}:
-        try:
-            import torch_npu as loaded_torch_npu  # type: ignore[import-not-found]
-
-            torch_npu = loaded_torch_npu
-        except Exception:
-            torch_npu = None
-        if torch_npu is not None and hasattr(torch, "npu") and torch.npu.is_available():
-            return _npu_device_spec(torch, 0, torch_npu)
-        if preferred == "npu":
-            raise RuntimeError("Requested NPU profiling, but torch_npu/torch.npu is not available.")
-
-    if preferred in {"auto", "cuda"} and torch.cuda.is_available():
-        return _cuda_device_spec(torch, 0)
-    if preferred == "cuda":
-        raise RuntimeError("Requested CUDA profiling, but CUDA is not available.")
-
-    if allow_cpu or preferred == "cpu":
-        return DeviceSpec(kind="cpu", device="cpu", name="CPU", count=1), None
-    raise RuntimeError("No Ascend NPU or CUDA device is available for profiling.")
-
-
-def _synchronize(torch: Any, device_kind: str) -> None:
-    if device_kind == "npu" and hasattr(torch, "npu") and hasattr(torch.npu, "synchronize"):
-        torch.npu.synchronize()
-    elif device_kind == "cuda" and hasattr(torch, "cuda"):
-        torch.cuda.synchronize()
-
-
-def _release_device_memory(torch: Any, device_kind: str) -> None:
-    """gc + 清设备显存缓存。调用方须先 del 掉自己持有的 model/大张量引用再调本函数。
-
-    每个 ExecutionMode 节点都会 benchmark/profile/correctness 各加载一次完整模型上
-    设备；递归向下时若不释放，显存只增不减，深树必然 OOM。本函数只负责"已无引用后
-    把缓存还给设备"，与 _synchronize 同层、同 device_kind 风格；解引用由调用方做，
-    因为 Python 里 helper 删不掉调用方作用域的变量。
-    """
-    import gc
-    gc.collect()
-    if device_kind == "npu" and hasattr(torch, "npu") and hasattr(torch.npu, "empty_cache"):
-        torch.npu.empty_cache()
-    elif device_kind == "cuda" and hasattr(torch, "cuda") and hasattr(torch.cuda, "empty_cache"):
-        torch.cuda.empty_cache()
 
 
 def _load_model_from_file(model_path: str, class_name: str) -> Any:
@@ -803,26 +666,10 @@ def generate_input(torch: Any, model: Any, input_shape: tuple[int, ...], dtype: 
         return {"input_ids": torch.randint(0, _vocab_size(model), (batch, seq_len), device=device, dtype=torch.long)}
     return {"x": torch.randn(*input_shape, device=device, dtype=dtype)}
 
-
-def _run_forward(model: Any, inputs: dict[str, Any]) -> None:
-    if "input_ids" in inputs:
-        try:
-            model(input_ids=inputs["input_ids"])
-        except TypeError:
-            model(inputs["input_ids"])
-        return
-    if "x" in inputs:
-        try:
-            model(inputs["x"])
-        except TypeError:
-            model(**inputs)
-        return
-    model(**inputs)
-
-
+# 推理模式路由器
 def _run_profile_step(model: Any, inputs: dict[str, Any], config: ProfileConfig) -> None:
     if config.profile_mode == "forward":
-        _run_forward(model, inputs)
+        run_forward(model, inputs)
         return
     if config.profile_mode != "generate":
         raise ValueError(f"Unsupported profile_mode: {config.profile_mode}")
@@ -890,7 +737,7 @@ def prepare_model_and_input(torch: Any, model: Any, config: ProfileConfig, devic
     if dataset_inputs is not None:
         with torch.no_grad():
             _run_profile_step(model, dataset_inputs, config)
-        _synchronize(torch, device.kind)
+        synchronize(torch, device.kind)
         return model, dataset_inputs, dataset_manifest
 
     batch = config.input_shape[0] if config.input_shape else 1
@@ -900,7 +747,7 @@ def prepare_model_and_input(torch: Any, model: Any, config: ProfileConfig, devic
         try:
             with torch.no_grad():
                 _run_profile_step(model, inputs, config)
-            _synchronize(torch, device.kind)
+            synchronize(torch, device.kind)
             return model, inputs, None
         except Exception:
             if device.kind == "cuda" and hasattr(torch.cuda, "empty_cache"):
@@ -915,17 +762,25 @@ def _build_npu_profile_kwargs(torch_npu: Any, config: ProfileConfig) -> dict[str
     activities = [torch_npu.profiler.ProfilerActivity.NPU]
     if level in {"L1", "L2"}:
         activities.insert(0, torch_npu.profiler.ProfilerActivity.CPU)
-
+    # 兼容不同版本的 torch_npu
     try:
-        schedule = torch_npu.profiler.schedule(wait=0, warmup=0, active=config.profile_iters, repeat=1, skip_first=config.skip_first)
+        schedule = torch_npu.profiler.schedule(wait=0, 
+                                               warmup=0, 
+                                               active=config.profile_iters, 
+                                               repeat=1, 
+                                               skip_first=config.skip_first)
     except TypeError:
-        schedule = torch_npu.profiler.schedule(wait=0, warmup=0, active=config.profile_iters, repeat=1)
+        schedule = torch_npu.profiler.schedule(wait=0, 
+                                               warmup=0, 
+                                               active=config.profile_iters, 
+                                               repeat=1)
 
     kwargs: dict[str, Any] = {
         "activities": activities,
         "schedule": schedule,
         "on_trace_ready": torch_npu.profiler.tensorboard_trace_handler(str(config.profiler_output_dir)),
     }
+
     if level in {"L1", "L2"}:
         kwargs["record_shapes"] = config.record_shapes if config.record_shapes is not None else True
         kwargs["with_stack"] = level == "L2"
@@ -960,25 +815,113 @@ def _build_torch_profile_kwargs(torch: Any, config: ProfileConfig, device: Devic
     return kwargs
 
 
-def profile_model(
+def _warmup_phase(
     model: Any,
     inputs: dict[str, Any],
-    *,
     config: ProfileConfig,
+    torch: Any,
     device: DeviceSpec,
-    torch_module: Any | None = None,
-    torch_npu: Any | None = None,
-) -> tuple[list[KernelRecord], dict[str, Any]]:
-    """Run warmup and profiler capture, returning aggregated device events."""
+) -> None:
+    """Warmup to eliminate cold-start overhead.
 
-    torch = torch_module or _import_torch()
-    config.profiler_output_dir.mkdir(parents=True, exist_ok=True)
-
+    Runs the model several times without recording any metrics to ensure:
+    - Memory is allocated
+    - Kernels are compiled/selected
+    - Device drivers are initialized
+    """
     with torch.no_grad():
         for _ in range(config.warmup_iters):
             _run_profile_step(model, inputs, config)
-            _synchronize(torch, device.kind)
+            synchronize(torch, device.kind)
+    # Final sync to ensure warmup is completely done
+    synchronize(torch, device.kind)
 
+
+def _export_trace(prof: Any, config: ProfileConfig) -> Path | None:
+    """Export Chrome trace if supported and configured.
+
+    Returns:
+        Path to trace file if successful, None otherwise
+    """
+    if not config.export_trace or not hasattr(prof, "export_chrome_trace"):
+        return None
+
+    trace_path = config.profiler_output_dir / "trace.json"
+    try:
+        prof.export_chrome_trace(str(trace_path))
+        return trace_path
+    except Exception:
+        return None
+
+
+def _extract_kernel_records(
+    prof: Any,
+    device: DeviceSpec,
+    config: ProfileConfig,
+) -> list[KernelRecord]:
+    """Extract kernel records from profiler or fallback to CSV files.
+
+    Tries multiple sources in order:
+    1. profiler.key_averages() API
+    2. NPU kernel_details.csv (NPU only)
+    3. NPU op_statistic.csv (NPU only)
+
+    Returns:
+        List of KernelRecord sorted by device time (descending)
+    """
+    records: list[KernelRecord] = []
+
+    # Try profiler API first
+    if hasattr(prof, "key_averages"):
+        for evt in prof.key_averages(group_by_input_shape=True):
+            device_time_us = _event_device_time_us(evt, device.kind)
+            if device_time_us <= 0.0:
+                continue
+
+            name = str(getattr(evt, "key", "") or "")
+            if not name:
+                continue
+
+            records.append(
+                KernelRecord(
+                    name=name,
+                    op_type=classify_kernel(name),
+                    device_time_us=device_time_us,
+                    call_count=int(getattr(evt, "count", 1) or 1),
+                    input_shapes=_shape_string(getattr(evt, "input_shapes", "")),
+                )
+            )
+
+    # NPU fallback: try CSV files if profiler API returned nothing
+    if not records and device.kind == "npu":
+        records = _records_from_npu_kernel_details(config.profiler_output_dir)
+    if not records and device.kind == "npu":
+        records = _records_from_npu_op_statistic(config.profiler_output_dir)
+
+    records.sort(key=lambda r: r.device_time_us, reverse=True)
+    return records
+
+
+def _profiling_phase(
+    model: Any,
+    inputs: dict[str, Any],
+    config: ProfileConfig,
+    torch: Any,
+    device: DeviceSpec,
+    torch_npu: Any | None,
+) -> tuple[list[KernelRecord], dict[str, Any]]:
+    """Profiler collection for operator-level performance data and latency estimation.
+
+    Runs the profiler to collect kernel-level metrics using continuous submission
+    (no per-iteration sync) to better reflect async execution.
+
+    Latency is estimated from profiler's total device time, not from manual timing,
+    to avoid disrupting the async pipeline with frequent synchronization.
+
+    Returns:
+        Tuple of (kernel_records, profiler_artifacts)
+    """
+    # Select profiler based on device type
     if device.kind == "npu":
         if torch_npu is None:
             raise RuntimeError("torch_npu is required for NPU profiling.")
@@ -988,59 +931,76 @@ def profile_model(
         profile_factory = torch.profiler.profile
         profile_kwargs = _build_torch_profile_kwargs(torch, config, device)
 
+    # Run profiler
     with torch.no_grad():
         with profile_factory(**profile_kwargs) as prof:
-            measured_steps = config.profile_iters
-            total_steps = measured_steps + max(config.skip_first, 0) if device.kind == "npu" else measured_steps
-            latency_samples_ms: list[float] = []
-            for step_index in range(total_steps):
-                started = time.perf_counter()
+            # NPU may need extra skip_first steps
+            total_steps = config.profile_iters + max(config.skip_first, 0) \
+                          if device.kind == "npu" else config.profile_iters
+
+            for _ in range(total_steps):
                 _run_profile_step(model, inputs, config)
-                _synchronize(torch, device.kind)
-                elapsed_ms = (time.perf_counter() - started) * 1000.0
-                if device.kind != "npu" or step_index >= max(config.skip_first, 0):
-                    latency_samples_ms.append(elapsed_ms)
                 if hasattr(prof, "step"):
                     prof.step()
 
-    trace_path: Path | None = None
-    if config.export_trace and hasattr(prof, "export_chrome_trace"):
-        trace_path = config.profiler_output_dir / "trace.json"
-        try:
-            prof.export_chrome_trace(str(trace_path))
-        except Exception:
-            trace_path = None
+            # Single sync at the end to ensure all operations complete
+            synchronize(torch, device.kind)
 
-    records: list[KernelRecord] = []
-    if hasattr(prof, "key_averages"):
-        for evt in prof.key_averages(group_by_input_shape=True):
-            device_time_us = _event_device_time_us(evt, device.kind)
-            if device_time_us <= 0.0:
-                continue
-            name = str(getattr(evt, "key", "") or "")
-            if not name:
-                continue
-            op_type = classify_kernel(name)
-            records.append(
-                KernelRecord(
-                    name=name,
-                    op_type=op_type,
-                    device_time_us=device_time_us,
-                    call_count=int(getattr(evt, "count", 1) or 1),
-                    input_shapes=_shape_string(getattr(evt, "input_shapes", "")),
-                )
-            )
-    if not records and device.kind == "npu":
-        records = _records_from_npu_kernel_details(config.profiler_output_dir)
-    if not records and device.kind == "npu":
-        records = _records_from_npu_op_statistic(config.profiler_output_dir)
+    # Export trace if configured
+    trace_path = _export_trace(prof, config)
 
-    records.sort(key=lambda item: item.device_time_us, reverse=True)
-    artifacts: dict[str, Any] = {"profiler_output_dir": str(config.profiler_output_dir)}
-    if latency_samples_ms:
-        artifacts["latency_samples_ms"] = [round(value, 6) for value in latency_samples_ms]
+    # Extract kernel records
+    records = _extract_kernel_records(prof, device, config)
+
+    # Build artifacts dict
+    artifacts: dict[str, Any] = {}
     if trace_path is not None:
         artifacts["trace_path"] = str(trace_path)
+
+    return records, artifacts
+
+
+def profile_model(
+    model: Any,
+    inputs: dict[str, Any],
+    *,
+    config: ProfileConfig,
+    device: DeviceSpec,
+    torch_module: Any | None = None,
+    torch_npu: Any | None = None,
+) -> tuple[list[KernelRecord], dict[str, Any]]:
+    """Run profiling to collect operator-level performance data.
+
+    This function focuses solely on identifying performance bottlenecks at the
+    operator level. For accurate end-to-end latency measurement, use benchmark.py
+    which runs without profiler overhead.
+
+    Workflow:
+    1. Warmup - eliminate cold-start overhead (not recorded)
+    2. Profiler collection - operator-level performance data
+
+    Returns:
+        Tuple of (kernel_records, artifacts_dict)
+        - kernel_records: sorted by device time (slowest first)
+        - artifacts_dict: profiler output paths and metadata
+    """
+    torch = torch_module or import_torch()
+    config.profiler_output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Warmup phase
+    _warmup_phase(model, inputs, config, torch, device)
+
+    # Profiler collection phase
+    records, profiler_artifacts = _profiling_phase(
+        model, inputs, config, torch, device, torch_npu
+    )
+
+    # Build final artifacts
+    artifacts: dict[str, Any] = {
+        "profiler_output_dir": str(config.profiler_output_dir),
+        **profiler_artifacts,
+    }
+
     return records, artifacts
 
 
@@ -1116,47 +1076,6 @@ def _csv_count(value: Any) -> int:
     if count is None:
         return 1
     return max(int(count), 1)
-
-
-def _float_list(values: Any) -> list[float]:
-    if not isinstance(values, list):
-        return []
-    result: list[float] = []
-    for value in values:
-        numeric = _to_float(value)
-        if numeric is not None:
-            result.append(numeric)
-    return result
-
-
-def _latency_stats_ms(samples: list[float]) -> dict[str, Any]:
-    if not samples:
-        return {}
-    count = len(samples)
-    ordered = sorted(samples)
-    mean = sum(ordered) / count
-    minimum = ordered[0]
-    maximum = ordered[-1]
-    midpoint = count // 2
-    if count % 2:
-        median = ordered[midpoint]
-    else:
-        median = (ordered[midpoint - 1] + ordered[midpoint]) / 2.0
-    variance = sum((value - mean) ** 2 for value in samples) / count if count > 1 else 0.0
-    stddev = math.sqrt(variance)
-    coefficient_of_variation = (stddev / mean) if mean else 0.0
-    return {
-        "count": count,
-        "mean": round(mean, 6),
-        "median": round(median, 6),
-        "min": round(minimum, 6),
-        "max": round(maximum, 6),
-        "std": round(stddev, 6),
-        "stddev": round(stddev, 6),
-        "coefficient_of_variation": round(coefficient_of_variation, 8),
-        "range": round(maximum - minimum, 6),
-        "noise_relative": round(((maximum - minimum) / mean) if mean else 0.0, 8),
-    }
 
 
 def build_profile_report(
@@ -1236,10 +1155,7 @@ def build_profile_report(
     }
     if artifacts:
         report["artifacts"] = dict(artifacts)
-        latency_samples_ms = _float_list(artifacts.get("latency_samples_ms"))
-        if latency_samples_ms:
-            report["latency_samples_ms"] = [round(value, 6) for value in latency_samples_ms]
-            report["latency_stats_ms"] = _latency_stats_ms(latency_samples_ms)
+
     return report
 
 
@@ -1270,7 +1186,7 @@ def print_report(report: dict[str, Any]) -> None:
 def generate_profile_report(config: ProfileConfig) -> ProfileRunResult:
     config = apply_analysis_preset(config)
     device, torch_npu = detect_device(config.device, allow_cpu=config.allow_cpu)
-    torch = _import_torch()
+    torch = import_torch()
     model, model_desc = load_model(config)
     model, inputs, dataset_manifest = prepare_model_and_input(torch, model, config, device)
     records, artifacts = profile_model(

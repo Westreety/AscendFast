@@ -1,7 +1,7 @@
 """verify：把每个环节"已经在做但形态不一"的成败判断，收敛成一个 StageOutcome
 
-实现 [[ADR-0007]] 的可观测层：stage() 吞异常落成 StageOutcome、gate_* 纯函数门禁、
-RunLedger 落盘决策轨迹。gate_apply 与 apply 的运行 forward gate（[[ADR-0008]]）配合。
+可观测层：stage() 吞异常落成 StageOutcome、gate_* 纯函数门禁、
+RunLedger 落盘决策轨迹。gate_apply 与 apply 的运行 forward gate 配合。
 + 一个 stage() 机制记录下来；门禁是喂给它的纯函数。
 
 不发明新观测层。这里只做三件事，全部围绕 RunLedger / StageOutcome 两个实体：
@@ -26,7 +26,8 @@ import json
 from contextlib import contextmanager
 from pathlib import Path
 
-from models import ExecutionMode, OptimizationStrategy, RunLedger, StageOutcome
+from models import ExecutionMode, OperatorArtifact, OptimizationStrategy, RunLedger, StageOutcome
+from trace_store import record_event
 
 _LEDGER_NAME = "run_ledger.json"
 _PROJECT_ROOT = Path(__file__).parent
@@ -40,10 +41,6 @@ _CURRENT_LEDGER: RunLedger | None = None
 def set_current_ledger(ledger: RunLedger | None) -> None:
     global _CURRENT_LEDGER
     _CURRENT_LEDGER = ledger
-
-
-def current_ledger() -> RunLedger | None:
-    return _CURRENT_LEDGER
 
 
 # --------------------------------------------------------------------------- #
@@ -104,6 +101,29 @@ def gate_strategy(strategies: list[OptimizationStrategy] | None) -> tuple[bool, 
     return True, ""
 
 
+# 数值自检阈值：与 operator.py 保持一致(fp16 舍入噪声约 2e-3 相对，留舒适余量)。
+_OPERATOR_REL_ERR_MAX = 5e-2
+
+
+def gate_operator(artifact: "OperatorArtifact | None") -> tuple[bool, str]:
+    """自定义算子门禁：operator-agent 产出的算子是否真可用。
+
+    与 gate_strategy/gate_apply 同为纯函数门禁。算子缺席本身是允许的降级(调用方据此把
+    artifact 置 None、apply 退回官方算子)，所以这里 ok=False 不代表 run 失败，只代表
+    「这个自定义算子不可用、别当成已验证算子喂给 apply」。三关：拿到 artifact 了吗、
+    声称装上了吗、数值自检过关吗。"""
+    if artifact is None:
+        return False, "operator agent produced no artifact"
+    if not artifact.installed:
+        return False, "operator not installed (compile/install/register failed)"
+    err = artifact.numeric_max_rel_err
+    if err is None:
+        return False, "operator missing numeric self-check result"
+    if err > _OPERATOR_REL_ERR_MAX:
+        return False, f"operator numeric error too large: {err:.4g} > {_OPERATOR_REL_ERR_MAX:.4g}"
+    return True, ""
+
+
 def gate_apply(child: ExecutionMode | None, base: ExecutionMode) -> tuple[bool, str]:
     """apply 产出了真 ChangeRecord 门禁——None-record bug 的根因，现在显式拦下。
 
@@ -126,7 +146,7 @@ def record_agent_call(agent_name: str, status: str, detail: str = "") -> None:
     """记一条 agent_call StageOutcome。status: ok|disabled|timeout|subprocess_error|
     unexpected|agent_error|bad_json。ok=(status=="ok")；永不抛异常、永不影响调用方的
     None 契约。"""
-    _record(current_ledger(), StageOutcome(
+    _record(_CURRENT_LEDGER, StageOutcome(
         stage="agent_call",
         ok=(status == "ok"),
         reason="" if status == "ok" else f"{status}: {detail}".strip(": "),
@@ -161,3 +181,13 @@ def write_ledger(ledger: RunLedger) -> Path:
 def _record(ledger: RunLedger | None, outcome: StageOutcome) -> None:
     if ledger is not None:
         ledger.outcomes.append(outcome)
+    record_event(
+        "stage_outcome",
+        {
+            "stage": outcome.stage,
+            "ok": outcome.ok,
+            "reason": outcome.reason,
+            "metadata": outcome.metadata,
+        },
+        refs={"mode_uid": outcome.mode_uid, "stage": outcome.stage},
+    )

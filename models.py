@@ -1,8 +1,38 @@
-# Data entities. LEVER_KINDS is the single source of truth per [[ADR-0005]];
-# ExecutionMode + ChangeRecord realize the workspace model of [[ADR-0004]] /
-# [[RFC-0001]]; StageOutcome + RunLedger realize the observability layer of [[ADR-0007]].
+# Data entities. LEVER_KINDS is the single source of truth for optimization levers;
+# ExecutionMode + ChangeRecord realize the workspace model; StageOutcome + RunLedger
+# realize the observability layer.
 from __future__ import annotations
 from dataclasses import dataclass, field
+
+
+@dataclass
+class ModelMetadata:
+    """模型的元信息，用于 agent 理解模型结构。
+
+    由 ensure_baseline_mode 从 config.json 提取并填充到 ExecutionMode，
+    后续所有操作（profile/analyze/strategy/apply）都从 ExecutionMode 读取。
+
+    关键字段说明：
+    - model_class: 模型类名，如 "Qwen2ForCausalLM"
+    - model_module: 完整的 Python 模块路径，如 "transformers.models.qwen2.modeling_qwen2"
+    - model_source_file: 源文件的**绝对路径**，如 "/path/.venv/.../modeling_qwen2.py"
+                         ↑ 这是 agent 需要 Read 的文件，包含模型各层的完整定义
+    - model_source_module: 备用模块路径（跨环境时可通过 import + inspect 重新定位）
+    - pretrained_name_or_path: 预训练模型标识，如 "Qwen/Qwen2-0.5B" 或本地路径
+    - framework: 来源框架，如 "transformers", "timm", "local"
+
+    Agent 使用方式：
+        if metadata.model_source_file:
+            source_code = Read(metadata.model_source_file)
+            # 现在可以看到 Qwen2Attention, Qwen2MLP 等类的完整定义
+            # 理解模型结构，提出针对性优化
+    """
+    model_class: str                        # 模型类名
+    model_module: str                       # Python 模块路径
+    model_source_file: str | None = None    # 源文件绝对路径（agent Read 这个文件）
+    model_source_module: str | None = None  # 备用模块路径
+    pretrained_name_or_path: str | None = None
+    framework: str = "unknown"
 
 
 # --------------------------------------------------------------------------- #
@@ -78,25 +108,86 @@ class RunLedger:
 @dataclass
 class OptimizationStrategy:
     uid: str
+    execution_mode_uid: str                         # 关联的 ExecutionMode
     local_speedup_ratio: float
     measures: list[str]
     prompt_instruction: str
+    model_metadata: ModelMetadata | None = None     # 从 ExecutionMode 复制，供 apply-agent 使用
     extra: dict | None = None
+
+
+# --------------------------------------------------------------------------- #
+# 自定义算子的请求/产物：坐在 apply 的两阶段之间，由 operator-agent 消费/产出。
+#
+# 拆分动机：apply-agent 的 HOW 其实混了两种性质迥异的事——「写 AscendC kernel +
+# 编译 + 装进 CANN」(分钟级、要编译、改全局)和「把算子接进 build_model()」(秒级、
+# 只动 workspace)。OperatorSpec/Artifact 把前者从 apply 里剥出来交给 operator-agent。
+#
+# 谁产 spec：spec 的作者是 **apply-agent**，不是 strategy。理由——
+# strategy 只看得到 profile 的热点算子名，看不到真实 forward 源码/真实 dtype/shape；
+# apply-agent fork 出 workspace 后能读真实代码与 model/config.json，产出的 spec 带准确
+# 的 arch_params 和一段可执行的 torch_reference(数值金标准)。所以流程是两阶段握手：
+# apply(phase1) 读代码→发布 OperatorSpec → operator-agent 据此 design+compile+install+
+# 数值自检 → apply(phase2) 把已验证的 OperatorArtifact 接进 build_model()。strategy 仍
+# 可在 extra.custom_operator 里给一个「提示」，但采不采纳由 apply-agent 读完真实代码定。
+# operator 生成失败 ≠ strategy 失败：artifact 缺省为 None，apply 退回官方/eager 算子。
+# --------------------------------------------------------------------------- #
+@dataclass
+class OperatorSpec:
+    """apply-agent(phase1) → operator-agent 的请求：要一个什么算子，及为什么官方不够。
+
+    WHAT/WHY 级别，不含 kernel 实现细节(那是 operator-agent 的 HOW)。arch_params 是
+    apply-agent 从本模型架构(workspace 的 model/config.json)读出的特化参数(hidden_size /
+    num_heads / head_dim / dtype / eps ...)，让 operator-agent 能为「本模型」而非
+    「通用情况」特化 kernel——这正是自定义算子相对官方通用算子的价值来源。torch_reference
+    是 apply-agent 从真实 forward 抽出的一段可执行参考，给 operator-agent 当数值 oracle。
+    """
+    op_name: str                        # 期望的算子名(下划线小写，如 rms_norm_residual)，
+                                        #  最终注册为 torch.ops.ascendfast.<op_name>
+    semantic: str                       # 算子数学语义(一句话/伪代码)，operator-agent 据此写 kernel
+    why_custom: str                     # 为什么官方 torch_npu 没有合适实现(融合点/特化点)
+    fusion_targets: list[str] = field(default_factory=list)  # 想融进一个 kernel 的算子序列
+    arch_params: dict = field(default_factory=dict)          # 本模型架构特化参数
+    expected_signature: str | None = None                    # 期望调用签名(自然语言/伪签名)
+    torch_reference: str | None = None  # 算子的 I/O 契约 + 数值金标准：一段自包含 torch
+                                        #  参考(class Model + get_inputs)，由 apply-agent 从
+                                        #  build_model() 接线点**真实要被替换掉的那段 eager
+                                        #  代码**抽出——forward 是精确语义，get_inputs 给出真实
+                                        #  流经该点的 shape/dtype。operator-agent 据此设计 kernel
+                                        #  的 tiling/签名，并 exec 它当 oracle 做数值自检。
+
+
+@dataclass
+class OperatorArtifact:
+    """operator-agent → apply 的产物：一个已注册、已数值自检的 torch.ops.ascendfast.<op>。
+
+    apply-agent 拿到它就像拿到一个「已知签名、已验证」的算子，把它接进 build_model()
+    即可(并保留官方/eager fallback)。installed=False 或数值不过关时，optimization 的
+    gate_operator 会拦下、artifact 不传给 apply，apply 退回官方算子。
+    """
+    op_name: str                        # 算子名(同 OperatorSpec.op_name)
+    qualified_name: str                 # 完整调用名，如 "torch.ops.ascendfast.rms_norm_residual"
+    signature: str                      # 实际调用签名，如 "rms_norm_residual(x, residual, gamma, eps) -> (y, new_residual)"
+    installed: bool = False             # B链.run 已装 + A链.so 已编 + import 后 op 真实存在
+    supported_dtypes: list[str] = field(default_factory=list)   # 如 ["float16", "float32"]
+    numeric_max_rel_err: float | None = None    # 对 fp32 参考的最大相对误差(数值自检结果)
+    usage_note: str = ""                # 给 apply-agent 的接入提示(形状约束、reshape、返回 tuple 等)
+    files: list[str] = field(default_factory=list)              # kernels/ 下新增/改动的文件
+    metadata: dict | None = None
 
 
 @dataclass
 class AnalysisResult:
     uid: str
-    total_latency: float
-    top_ops: list[str]
-    hot_groups: dict[str, list[str]]
+    execution_mode_uid: str | None = None           # 关联的 ExecutionMode（通过它获取 model_metadata）
+    top_ops: list[str] = field(default_factory=list)
+    hot_groups: dict[str, list[str]] = field(default_factory=dict)
     extra: dict | None = None
     model_id: str | None = None
     device_kind: str | None = None
     device_name: str | None = None
     dtype: str | None = None
     profile_report_path: str | None = None
-    latency_stats_ms: dict | None = None
     dataset: dict | None = None
     top_kernels: list[dict] = field(default_factory=list)
     op_type_totals: dict[str, dict] = field(default_factory=dict)
@@ -112,6 +203,9 @@ class ExecutionMode:
     build_model() -> (model, tokenizer)，无论里面是何种优化，correctness/profile
     都只通过这个入口加载，对优化方案本身无知。change_log 是从 root 累积到本步
     的全部修改（append-only），下一轮 apply 会把它注入 Agent 以便叠加优化。
+
+    model_metadata 在 ensure_baseline_mode 时从 config.json 提取并填充，包含
+    模型源代码位置等信息，供 strategy-agent 和 apply-agent 理解模型结构。
     """
     uid: str
     model_id: str                                   # 基础模型标识
@@ -121,15 +215,20 @@ class ExecutionMode:
     entrypoint: str = "build_model.py"              # 统一入口文件（相对 workspace_dir）
     change_log: list[ChangeRecord] = field(default_factory=list)
     correctness_passed: bool | None = None
+    model_metadata: ModelMetadata | None = None     # 模型元信息（ensure_baseline_mode 时填充）
     extra: dict | None = None
 
 
 @dataclass
 class ProfileResult:
+    """Profile 的结果：算子级性能分析数据。
+
+    profile 只负责定位热点（算子占比、roofline），不产出延迟。
+    真实的 end-to-end 延迟由 benchmark.py 在自己的数据集上测量，
+    两者数据集口径不同，不可混用。
+    """
     uid: str
     execution_mode_uid: str
-    latency_before: float
-    latency_after: float
     extra: dict | None = None
     profile_report_path: str | None = None
     profiler_output_dir: str | None = None

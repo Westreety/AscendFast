@@ -1,3 +1,0 @@
-[2026-06-03-14:17:01.007] [INFO] [AscendProfiler_CANNAnalyzeParser:97] Profiler logger initialized at: /models/share/userdata/cb/AscendFast/profiles/profile_py_yi_6b_real/codeserver-demo2-0_83806_20260603141656210_ascend_pt/logs/profiler_20260603141701_85089_CANNAnalyzeParser.log
-[2026-06-03-14:17:01.008] [INFO] [AscendProfiler_CANNAnalyzeParser:41] CANNAnalyzeParser start.
-[2026-06-03-14:17:02.040] [INFO] [AscendProfiler_CANNAnalyzeParser:67] CANNAnalyzeParser finish.

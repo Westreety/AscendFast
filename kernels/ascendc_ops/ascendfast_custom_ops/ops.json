@@ -24,5 +24,39 @@
                 "type": ["float16", "float"]
             }
         ]
+    },
+    {
+        "op": "RmsNormCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": ["ND", "ND"],
+                "type": ["float16", "float"]
+            },
+            {
+                "name": "gamma",
+                "param_type": "required",
+                "format": ["ND", "ND"],
+                "type": ["float16", "float"]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": ["ND", "ND"],
+                "type": ["float16", "float"]
+            }
+        ],
+        "attr": [
+            {
+                "name": "epsilon",
+                "param_type": "optional",
+                "type": "float",
+                "default_value": 0.000001
+            }
+        ]
     }
 ]
