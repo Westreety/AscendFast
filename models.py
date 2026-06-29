@@ -5,6 +5,36 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 
+@dataclass
+class ModelMetadata:
+    """模型的元信息，用于 agent 理解模型结构。
+
+    由 ensure_baseline_mode 从 config.json 提取并填充到 ExecutionMode，
+    后续所有操作（profile/analyze/strategy/apply）都从 ExecutionMode 读取。
+
+    关键字段说明：
+    - model_class: 模型类名，如 "Qwen2ForCausalLM"
+    - model_module: 完整的 Python 模块路径，如 "transformers.models.qwen2.modeling_qwen2"
+    - model_source_file: 源文件的**绝对路径**，如 "/path/.venv/.../modeling_qwen2.py"
+                         ↑ 这是 agent 需要 Read 的文件，包含模型各层的完整定义
+    - model_source_module: 备用模块路径（跨环境时可通过 import + inspect 重新定位）
+    - pretrained_name_or_path: 预训练模型标识，如 "Qwen/Qwen2-0.5B" 或本地路径
+    - framework: 来源框架，如 "transformers", "timm", "local"
+
+    Agent 使用方式：
+        if metadata.model_source_file:
+            source_code = Read(metadata.model_source_file)
+            # 现在可以看到 Qwen2Attention, Qwen2MLP 等类的完整定义
+            # 理解模型结构，提出针对性优化
+    """
+    model_class: str                        # 模型类名
+    model_module: str                       # Python 模块路径
+    model_source_file: str | None = None    # 源文件绝对路径（agent Read 这个文件）
+    model_source_module: str | None = None  # 备用模块路径
+    pretrained_name_or_path: str | None = None
+    framework: str = "unknown"
+
+
 # --------------------------------------------------------------------------- #
 # 优化杠杆（lever）的权威枚举——单一真相源。
 # strategy 选 lever、apply 记 kind、ledger 归因都引用这里；新增/改名 lever 只动
@@ -78,9 +108,11 @@ class RunLedger:
 @dataclass
 class OptimizationStrategy:
     uid: str
+    execution_mode_uid: str                         # 关联的 ExecutionMode
     local_speedup_ratio: float
     measures: list[str]
     prompt_instruction: str
+    model_metadata: ModelMetadata | None = None     # 从 ExecutionMode 复制，供 apply-agent 使用
     extra: dict | None = None
 
 
@@ -147,8 +179,9 @@ class OperatorArtifact:
 @dataclass
 class AnalysisResult:
     uid: str
-    top_ops: list[str]
-    hot_groups: dict[str, list[str]]
+    execution_mode_uid: str | None = None           # 关联的 ExecutionMode（通过它获取 model_metadata）
+    top_ops: list[str] = field(default_factory=list)
+    hot_groups: dict[str, list[str]] = field(default_factory=dict)
     extra: dict | None = None
     model_id: str | None = None
     device_kind: str | None = None
@@ -170,6 +203,9 @@ class ExecutionMode:
     build_model() -> (model, tokenizer)，无论里面是何种优化，correctness/profile
     都只通过这个入口加载，对优化方案本身无知。change_log 是从 root 累积到本步
     的全部修改（append-only），下一轮 apply 会把它注入 Agent 以便叠加优化。
+
+    model_metadata 在 ensure_baseline_mode 时从 config.json 提取并填充，包含
+    模型源代码位置等信息，供 strategy-agent 和 apply-agent 理解模型结构。
     """
     uid: str
     model_id: str                                   # 基础模型标识
@@ -179,6 +215,7 @@ class ExecutionMode:
     entrypoint: str = "build_model.py"              # 统一入口文件（相对 workspace_dir）
     change_log: list[ChangeRecord] = field(default_factory=list)
     correctness_passed: bool | None = None
+    model_metadata: ModelMetadata | None = None     # 模型元信息（ensure_baseline_mode 时填充）
     extra: dict | None = None
 
 

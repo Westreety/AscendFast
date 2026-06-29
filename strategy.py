@@ -6,24 +6,30 @@ from __future__ import annotations
 import json
 
 from agent_client import AGENT_ENABLED, call_agent_json
-from models import LEVER_KINDS, AnalysisResult, OptimizationStrategy
+from models import LEVER_KINDS, AnalysisResult, ExecutionMode, OptimizationStrategy
 
 
 def generate_optimization_strategies(
     analysis: AnalysisResult,
     max_count: int = 5,
+    execution_mode: ExecutionMode | None = None,
 ) -> list[OptimizationStrategy]:
     """LLM strategy agent (no rule-based fallback).
 
     Requires the agent runtime to be enabled; raises otherwise so the failure
     is visible instead of silently degrading to an empty strategy list.
+
+    Args:
+        analysis: 分析结果
+        max_count: 最多生成策略数
+        execution_mode: 关联的 ExecutionMode（用于获取 model_metadata）
     """
     try:
         if not AGENT_ENABLED:
             raise RuntimeError(
                 f"strategy agent unavailable: AGENT_ENABLED={AGENT_ENABLED!r}"
             )
-        return _llm_generate_optimization_strategies(analysis, max_count) or []
+        return _llm_generate_optimization_strategies(analysis, max_count, execution_mode) or []
     except Exception as exc:
         print(f"[strategy] generate failed (AGENT_ENABLED={AGENT_ENABLED!r}): {exc}")
         raise
@@ -32,6 +38,7 @@ def generate_optimization_strategies(
 def _llm_generate_optimization_strategies(
     analysis: AnalysisResult,
     max_count: int,
+    execution_mode: ExecutionMode | None,
 ) -> list[OptimizationStrategy] | None:
     top_ops = analysis.top_ops[:10] if analysis.top_ops else []
     prompt = (
@@ -91,29 +98,35 @@ def _llm_generate_optimization_strategies(
     for item in raw_strategies:
         if not isinstance(item, dict) or len(strategies) >= max_count:
             continue
-        measures = item.get("measures") if isinstance(item.get("measures"), list) else ["see focus"]
-        focus = str(item.get("focus") or "")
-        speedup = _to_float(item.get("local_speedup_ratio")) or 1.05
+        measures = item.get(“measures”) if isinstance(item.get(“measures”), list) else [“see focus”]
+        focus = str(item.get(“focus”) or “”)
+        speedup = _to_float(item.get(“local_speedup_ratio”)) or 1.05
         # lever 规范化到 LEVER_KINDS：未指定/未知值默认 forward_patch（最窄、最低风险）。
-        raw_kind = str(item.get("kind") or "").strip()
-        kind = raw_kind if raw_kind in LEVER_KINDS else "forward_patch"
+        raw_kind = str(item.get(“kind”) or “”).strip()
+        kind = raw_kind if raw_kind in LEVER_KINDS else “forward_patch”
         # 可选 custom_operator：仅在 agent 凭热点判断「官方可能无合适算子」时附带。规范化成
-        # 一个干净 dict 存进 extra，apply-agent(discover) 把它当“提示”读（采不采纳由它读完
+        # 一个干净 dict 存进 extra，apply-agent(discover) 把它当”提示”读（采不采纳由它读完
         # 真实代码定）。spec 的权威作者是 apply-agent，不是这里。
-        custom_op = _normalize_custom_operator(item.get("custom_operator"))
+        custom_op = _normalize_custom_operator(item.get(“custom_operator”))
+
+        # 从 ExecutionMode 获取 model_metadata 并复制到 strategy
+        model_metadata = execution_mode.model_metadata if execution_mode else None
+
         strategies.append(
             OptimizationStrategy(
-                uid=f"strategy:{analysis.uid}:{len(strategies) + 1}",
+                uid=f”strategy:{analysis.uid}:{len(strategies) + 1}”,
+                execution_mode_uid=execution_mode.uid if execution_mode else None,
                 local_speedup_ratio=round(speedup, 4),
                 measures=measures,
                 prompt_instruction=_build_strategy_prompt(analysis, focus, measures, kind),
+                model_metadata=model_metadata,  # 复制给 apply-agent
                 extra={
-                    "kind": kind,
-                    "model_id": analysis.model_id,
-                    "device_kind": analysis.device_kind,
-                    "device_name": analysis.device_name,
-                    "dtype": analysis.dtype,
-                    "custom_operator": custom_op,   # None 或一个 hint dict
+                    “kind”: kind,
+                    “model_id”: analysis.model_id,
+                    “device_kind”: analysis.device_kind,
+                    “device_name”: analysis.device_name,
+                    “dtype”: analysis.dtype,
+                    “custom_operator”: custom_op,   # None 或一个 hint dict
                 },
             )
         )

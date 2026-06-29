@@ -76,7 +76,6 @@ def analyze_profile(
 
     analysis_extra = {
         "source_profile_uid": profile.uid,
-        "execution_mode_uid": profile.execution_mode_uid,
         "total_device_time_ms": report.get("total_device_time_ms"),
         "profile_iters": report.get("profile_iters"),
         "total_kernels": report.get("total_kernels"),
@@ -89,6 +88,7 @@ def analyze_profile(
 
     return AnalysisResult(
         uid=f"analysis:{profile.uid}",
+        execution_mode_uid=profile.execution_mode_uid,  # 关联 ExecutionMode
         top_ops=top_ops,
         hot_groups=hot_groups,
         extra=analysis_extra,

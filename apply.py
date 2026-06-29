@@ -3,6 +3,8 @@
 # Forks honor the build_model() entrypoint contract.
 from __future__ import annotations
 
+import importlib
+import inspect
 import json
 import os
 import shutil
@@ -14,6 +16,7 @@ from models import (
     CHANGE_KINDS,
     ChangeRecord,
     ExecutionMode,
+    ModelMetadata,
     OperatorArtifact,
     OptimizationStrategy,
 )
@@ -31,6 +34,74 @@ _ADAPTATIONS = _PROJECT_ROOT / "adaptations"
 _WEIGHT_SUFFIXES = {".safetensors", ".bin", ".pt", ".pth", ".gguf", ".onnx"}
 
 
+def _extract_baseline_metadata(model_id: str, model_dir: Path) -> ModelMetadata:
+    """从 model_dir 提取模型元信息（无需加载模型，读 config.json）。
+
+    完整流程：
+    1. 读取 config.json
+    2. 提取 architectures[0] → model_class
+    3. 提取 model_type → 推断 model_module
+    4. Import 模块 → inspect.getfile() → model_source_file
+    5. 构建并返回 ModelMetadata
+
+    返回的 ModelMetadata.model_source_file 指向模型定义文件（如 modeling_qwen2.py），
+    agent 可以直接 Read 这个文件来理解模型的层结构（Attention, MLP 等）。
+    """
+    config_path = model_dir / "config.json"
+
+    # === Step 1 & 2: 读取 config.json 并提取关键信息 ===
+    if config_path.exists():
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+
+            architectures = config.get("architectures", [])
+            model_class = architectures[0] if architectures else None
+            model_type = config.get("model_type", "").lower()  # "qwen2", "llama" 等
+
+            if model_class and model_type:
+                # === Step 3: 推断 Python 模块路径 ===
+                # transformers 的标准命名规范：
+                # transformers.models.<model_type>.modeling_<model_type>
+                model_module = f"transformers.models.{model_type}.modeling_{model_type}"
+
+                # === Step 4: Import 模块并获取源文件路径 ===
+                model_source_file = None
+                try:
+                    # Import 模块（不会加载模型权重，只是 import Python 文件）
+                    module = importlib.import_module(model_module)
+                    # 获取这个 Python 文件的绝对路径
+                    source_file = inspect.getfile(module)
+                    model_source_file = str(Path(source_file).resolve())
+                    # 示例结果：
+                    # "/path/.venv/lib64/python3.10/site-packages/transformers/models/qwen2/modeling_qwen2.py"
+                except Exception as e:
+                    # Import 失败时 model_source_file 为 None
+                    print(f"[info] Could not locate source file for {model_module}: {e}")
+
+                # === Step 5: 构建 ModelMetadata ===
+                return ModelMetadata(
+                    model_class=model_class,
+                    model_module=model_module,
+                    model_source_file=model_source_file,  # ← agent 要读的文件！
+                    model_source_module=model_module,
+                    pretrained_name_or_path=str(model_dir),
+                    framework="transformers",
+                )
+        except Exception as e:
+            print(f"[warn] Failed to extract metadata from config.json: {e}")
+
+    # === Fallback: 兜底方案 ===
+    # 如果 config.json 不存在或解析失败，返回基本信息
+    return ModelMetadata(
+        model_class="AutoModelForCausalLM",  # 通用类名
+        model_module="transformers",
+        model_source_file=None,  # 无法定位源文件
+        model_source_module=None,
+        pretrained_name_or_path=str(model_dir),
+        framework="transformers",
+    )
+
+
 # --------------------------------------------------------------------------- #
 # baseline：把原始模型物化成一个合法的 ExecutionMode（优化链的根）
 # --------------------------------------------------------------------------- #
@@ -39,6 +110,9 @@ def ensure_baseline_mode(model_id: str, model_dir: str | Path) -> ExecutionMode:
 
     baseline 本身就是一个可运行的 mode，其 build_model() 即朴素加载，
     后续 apply 永远从某个 base_mode 出发，不再特判 model_id。
+
+    新增：提取并填充 model_metadata，让 ExecutionMode 一创建就完整自描述，
+    包含模型源代码位置等信息，供后续 agent 理解模型结构。
     """
     work_dir = _ADAPTATIONS / model_id / "baseline"
     manifest_path = work_dir / MANIFEST_NAME
@@ -51,6 +125,9 @@ def ensure_baseline_mode(model_id: str, model_dir: str | Path) -> ExecutionMode:
     _mirror_tree(model_dir, work_dir / "model")
     _write_baseline_entrypoint(work_dir)
 
+    # === 新增：提取模型元信息 ===
+    model_metadata = _extract_baseline_metadata(model_id, work_dir / "model")
+
     mode = ExecutionMode(
         uid="mode:baseline",
         model_id=model_id,
@@ -58,6 +135,7 @@ def ensure_baseline_mode(model_id: str, model_dir: str | Path) -> ExecutionMode:
         workspace_dir=str(work_dir),
         parent_uid=None,
         entrypoint=DEFAULT_ENTRYPOINT,
+        model_metadata=model_metadata,  # ← 创建时就填充
         change_log=[],
     )
     write_manifest(mode)

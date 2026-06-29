@@ -54,7 +54,8 @@
       "Bash(uv --version)",
       "Bash(file .venv/bin/python* .venv/bin/pip*)",
       "Bash(.venv/bin/python *)",
-      "Bash(grep -oP \".{0,300}Unable to handle.{0,300}\" /root/.vscode-server/extensions/ms-python.vscode-python-envs-1.20.1-linux-arm64/dist/extension.js)"
+      "Bash(grep -oP \".{0,300}Unable to handle.{0,300}\" /root/.vscode-server/extensions/ms-python.vscode-python-envs-1.20.1-linux-arm64/dist/extension.js)",
+      "Bash(\\\\ln -sf /root/miniconda3/envs/llm_test/bin/python3 python3.10)"
     ]
   }
 }

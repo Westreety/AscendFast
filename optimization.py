@@ -106,7 +106,7 @@ def optimize(
 
     print(f"{indent}  💡 generate strategies (top_k={top_k}) ...")
     with stage(ledger, "strategy", base_mode.uid) as st:
-        st.value = generate_optimization_strategies(analysis, top_k)
+        st.value = generate_optimization_strategies(analysis, top_k, execution_mode=base_mode)
         ok, reason = gate_strategy(st.value)
         if not ok:
             st.fail(reason)                 # 空策略列表门禁：不再静默零循环
