@@ -12,6 +12,7 @@ from pathlib import Path
 
 from agent_client import AGENT_ENABLED, call_agent_json
 from models import AnalysisResult, ExecutionMode, OperatorArtifact, OperatorSpec, OptimizationStrategy
+from trace_store import record_artifact, record_event
 
 _PROJECT_ROOT = Path(__file__).parent
 _REGISTRY_PATH = _PROJECT_ROOT / "kernels" / "registry.json"
@@ -78,16 +79,51 @@ def generate_operator(
     cached = _registry_lookup(spec.op_name)
     if cached is not None:
         print(f"[operator] reuse registered op '{spec.op_name}' (cached)")
-        return _artifact_from_registry(cached)
+        artifact = _artifact_from_registry(cached)
+        record_event(
+            "operator_completed",
+            {"ok": True, "cached": True, "artifact": artifact},
+            refs={"strategy_uid": strategy.uid, "stage": "operator"},
+        )
+        return artifact
 
     if not AGENT_ENABLED:
         print(f"[operator] agent disabled; no custom op for '{spec.op_name}'")
+        record_event(
+            "operator_completed",
+            {"ok": False, "reason": "agent disabled", "operator_spec": spec},
+            refs={"strategy_uid": strategy.uid, "stage": "operator"},
+        )
         return None
 
     try:
-        return _llm_generate_operator(spec, strategy, analysis, base_mode)
+        artifact = _llm_generate_operator(spec, strategy, analysis, base_mode)
+        record_event(
+            "operator_completed",
+            {"ok": artifact is not None, "artifact": artifact, "operator_spec": spec},
+            refs={
+                "mode_uid": base_mode.uid if base_mode is not None else None,
+                "strategy_uid": strategy.uid,
+                "analysis_uid": analysis.uid,
+                "stage": "operator",
+            },
+        )
+        if artifact is not None:
+            for rel_path in artifact.files:
+                record_artifact(_PROJECT_ROOT / rel_path, kind="operator_file")
+        return artifact
     except Exception as exc:  # noqa: BLE001 - 算子缺席是允许的降级，绝不炸穿主链
         print(f"[operator] generate failed for '{spec.op_name}': {type(exc).__name__}: {exc}")
+        record_event(
+            "operator_completed",
+            {"ok": False, "reason": f"{type(exc).__name__}: {exc}", "operator_spec": spec},
+            refs={
+                "mode_uid": base_mode.uid if base_mode is not None else None,
+                "strategy_uid": strategy.uid,
+                "analysis_uid": analysis.uid,
+                "stage": "operator",
+            },
+        )
         return None
 
 

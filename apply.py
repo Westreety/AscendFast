@@ -26,6 +26,7 @@ from mode_store import (
     load_mode,
     write_manifest,
 )
+from trace_store import record_apply_action, record_event, record_mode
 
 _PROJECT_ROOT = Path(__file__).parent
 _ADAPTATIONS = _PROJECT_ROOT / "adaptations"
@@ -193,8 +194,12 @@ def apply_discover(
 
     # 完成路径才跑 forward gate：融合/自定义算子的参数错误只在 forward 时暴露。
     # pending 路径还没接任何算子，没什么可前向验证的，跳过。
-    if record is not None and not _workspace_forward_ok(new_uid, base_mode, work_dir, record):
-        record = None
+    candidate_record = record
+    forward_gate_ok: bool | None = None
+    if record is not None:
+        forward_gate_ok = _workspace_forward_ok(new_uid, base_mode, work_dir, record)
+        if not forward_gate_ok:
+            record = None
 
     extra: dict = {}
     if pending_spec is not None:
@@ -208,9 +213,33 @@ def apply_discover(
         parent_uid=base_mode.uid,
         entrypoint=base_mode.entrypoint,
         change_log=new_change_log,
+        model_metadata=base_mode.model_metadata,
         extra=extra or None,
     )
     write_manifest(mode)
+    status = (
+        "operator_pending" if pending_spec is not None
+        else "applied" if record is not None
+        else "failed"
+    )
+    if pending_spec is not None:
+        record_event(
+            "operator_requested",
+            {"operator_spec": pending_spec, "strategy_uid": strategy.uid},
+            refs={"mode_uid": mode.uid, "strategy_uid": strategy.uid, "stage": "apply"},
+        )
+    record_apply_action(
+        strategy=strategy,
+        mode=mode,
+        base_mode=base_mode,
+        phase="discover",
+        status=status,
+        change_record=candidate_record,
+        operator_spec=pending_spec,
+        workspace_dir=work_dir,
+        forward_gate_ok=forward_gate_ok,
+    )
+    record_mode(mode)
     return mode
 
 
@@ -234,8 +263,12 @@ def apply_wire(
     if AGENT_ENABLED:
         record = _llm_apply_wire(strategy, pending_mode, new_uid, work_dir, operator_artifact)
 
-    if record is not None and not _workspace_forward_ok(new_uid, pending_mode, work_dir, record):
-        record = None
+    candidate_record = record
+    forward_gate_ok: bool | None = None
+    if record is not None:
+        forward_gate_ok = _workspace_forward_ok(new_uid, pending_mode, work_dir, record)
+        if not forward_gate_ok:
+            record = None
 
     new_change_log = pending_mode.change_log + ([record] if record is not None else [])
     mode = ExecutionMode(
@@ -246,9 +279,22 @@ def apply_wire(
         parent_uid=pending_mode.parent_uid,    # 原 base，不是 pending 自己
         entrypoint=pending_mode.entrypoint,
         change_log=new_change_log,
+        model_metadata=pending_mode.model_metadata,
         extra=None,                            # 清掉 pending 标记：这是完成态
     )
     write_manifest(mode)
+    record_apply_action(
+        strategy=strategy,
+        mode=mode,
+        base_mode=pending_mode,
+        phase="wire",
+        status="applied" if record is not None else "failed",
+        change_record=candidate_record,
+        operator_artifact=operator_artifact,
+        workspace_dir=work_dir,
+        forward_gate_ok=forward_gate_ok,
+    )
+    record_mode(mode)
     return mode
 
 

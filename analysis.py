@@ -8,6 +8,7 @@ from typing import Any
 
 from agent_client import AGENT_ENABLED, call_agent_json
 from models import AnalysisResult, ProfileResult
+from trace_store import record_analysis_result
 
 def analyze_profile(
     profile: ProfileResult,
@@ -86,7 +87,7 @@ def analyze_profile(
     if extra:
         analysis_extra["profile_extra"] = extra
 
-    return AnalysisResult(
+    result = AnalysisResult(
         uid=f"analysis:{profile.uid}",
         execution_mode_uid=profile.execution_mode_uid,  # 关联 ExecutionMode
         top_ops=top_ops,
@@ -103,6 +104,8 @@ def analyze_profile(
         roofline_summary=roofline_summary,
         profile_findings=profile_findings,
     )
+    record_analysis_result(result, profile)
+    return result
 
 def _load_profile_report(profile: ProfileResult) -> tuple[dict[str, Any], Path | None]:
     if isinstance(profile.profile_report, dict):

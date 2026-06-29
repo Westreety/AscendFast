@@ -13,6 +13,15 @@ from models import ExecutionMode, OperatorSpec, RunLedger
 from operator_gen import generate_operator
 from profile_runner import run_profile
 from strategy import generate_optimization_strategies
+from trace_store import (
+    finalize_run_trace,
+    record_artifact,
+    record_evaluation,
+    record_event,
+    record_mode,
+    record_reward,
+    start_run_trace,
+)
 from verify import (
     gate_apply,
     gate_operator,
@@ -62,11 +71,23 @@ def optimize(
     with stage(ledger, "benchmark", base_mode.uid) as st:
         st.value = run_real_benchmark(base_mode)
     if not st.ok:
+        record_evaluation(
+            base_mode.uid, "benchmark", ok=False, metric_name="latency_ms",
+            payload={"reason": st.reason},
+        )
         # 测不出延迟的候选记为无穷差，绝不能被选成 best（哪怕 baseline_latency 已有值）。
         ledger.stop_reason = ledger.stop_reason or "stage_failed:benchmark"
         return base_mode, float("inf")
 
     latency = st.value
+    record_evaluation(
+        base_mode.uid, "benchmark", ok=True, metric_name="latency_ms",
+        metric_value=float(latency), payload={"depth": depth},
+    )
+    record_artifact(
+        f"{base_mode.workspace_dir}/benchmark/benchmark_report.json",
+        kind="benchmark_report", mode_uid=base_mode.uid,
+    )
     # baseline（首次进入）只负责定标尺；child 才判断是否达成 2x——分开写避免
     # "刚设完 baseline_latency 又立刻拿它判 2x"的误读。
     if baseline_latency is None:
@@ -75,6 +96,13 @@ def optimize(
         print(f"{indent}  ✅ baseline latency = {latency:.4f} ms")
     else:
         speedup = baseline_latency / latency
+        record_reward(
+            base_mode.uid,
+            parent_mode_uid=base_mode.parent_uid,
+            strategy_uid=base_mode.strategy_uid,
+            value=float(speedup - 1.0),
+            payload={"baseline_latency": baseline_latency, "latency": latency, "speedup": speedup},
+        )
         print(f"{indent}  ✅ latency = {latency:.4f} ms  ({speedup:.2f}x vs baseline)")
         if latency <= baseline_latency / 2:
             print(f"{indent}  🎉 达成 2x 加速，提前终止！")
@@ -90,15 +118,37 @@ def optimize(
     with stage(ledger, "profile", base_mode.uid) as st:
         st.value = run_profile(base_mode)
     if not st.ok:
+        record_event(
+            "profile_collected",
+            {"ok": False, "reason": st.reason},
+            refs={"mode_uid": base_mode.uid, "stage": "profile"},
+        )
         print(f"{indent}  ❌ profile 失败，跳过")
         ledger.stop_reason = ledger.stop_reason or "stage_failed:profile"
         return base_mode, latency
     profile_result = st.value
+    record_event(
+        "profile_collected",
+        {
+            "ok": True,
+            "profile_uid": profile_result.uid,
+            "profile_report_path": profile_result.profile_report_path,
+            "profiler_output_dir": profile_result.profiler_output_dir,
+            "extra": profile_result.extra,
+        },
+        refs={"mode_uid": base_mode.uid, "profile_uid": profile_result.uid, "stage": "profile"},
+    )
+    record_artifact(profile_result.profile_report_path, kind="profile_report", mode_uid=base_mode.uid)
 
     print(f"{indent}  🧠 analyze ...")
     with stage(ledger, "analyze", base_mode.uid) as st:
         st.value = analyze_profile(profile_result)
     if not st.ok:
+        record_event(
+            "analysis_completed",
+            {"ok": False, "reason": st.reason},
+            refs={"mode_uid": base_mode.uid, "profile_uid": profile_result.uid, "stage": "analysis"},
+        )
         print(f"{indent}  ❌ analyze 失败，跳过")
         ledger.stop_reason = ledger.stop_reason or "stage_failed:analyze"
         return base_mode, latency
@@ -138,6 +188,14 @@ def optimize(
             else:
                 st.metadata = {"phase": (st.value.extra or {}).get("phase")}
         if not st.ok:
+            record_reward(
+                None,
+                parent_mode_uid=base_mode.uid,
+                strategy_uid=strategy.uid,
+                reward_type="apply_failure",
+                value=-1.0,
+                payload={"phase": "discover", "reason": st.reason},
+            )
             print(f"{indent}    ❌ apply(discover) 失败，跳过")
             continue
         child = st.value
@@ -154,10 +212,27 @@ def optimize(
                 if not ok:
                     st.fail(reason)
             if not st.ok:
+                record_reward(
+                    child.uid,
+                    parent_mode_uid=base_mode.uid,
+                    strategy_uid=strategy.uid,
+                    reward_type="operator_failure",
+                    value=-0.5,
+                    payload={"reason": st.reason},
+                )
                 print(f"{indent}    ⚠️  custom op unavailable ({st.reason}); 弃用此策略")
                 continue
             operator_artifact = st.value
             print(f"{indent}    ✅ custom op ready: {operator_artifact.qualified_name}")
+            record_event(
+                "operator_completed",
+                {
+                    "ok": True,
+                    "artifact": operator_artifact,
+                    "strategy_uid": strategy.uid,
+                },
+                refs={"mode_uid": base_mode.uid, "strategy_uid": strategy.uid, "stage": "operator"},
+            )
 
             with stage(ledger, "apply_wire", base_mode.uid) as st:
                 st.value = apply_wire(strategy, child, operator_artifact)
@@ -171,6 +246,14 @@ def optimize(
                         "custom_op": operator_artifact.qualified_name,
                     }
             if not st.ok:
+                record_reward(
+                    child.uid,
+                    parent_mode_uid=base_mode.uid,
+                    strategy_uid=strategy.uid,
+                    reward_type="apply_failure",
+                    value=-1.0,
+                    payload={"phase": "wire", "reason": st.reason},
+                )
                 print(f"{indent}    ❌ apply(wire) 失败，跳过")
                 continue
             child = st.value
@@ -189,6 +272,14 @@ def optimize(
                         "custom_op": None,
                     }
             if not st.ok:
+                record_reward(
+                    child.uid,
+                    parent_mode_uid=base_mode.uid,
+                    strategy_uid=strategy.uid,
+                    reward_type="apply_failure",
+                    value=-1.0,
+                    payload={"phase": "apply", "reason": st.reason},
+                )
                 print(f"{indent}    ❌ apply 失败，跳过")
                 continue
 
@@ -196,10 +287,43 @@ def optimize(
         with stage(ledger, "correctness", child.uid) as st:
             st.value = run_correctness_test(child, baseline_mode)
         if not st.ok:
+            record_evaluation(
+                child.uid, "correctness", ok=False,
+                metric_name="last_token_logits_cosine", payload={"reason": st.reason},
+            )
+            record_reward(
+                child.uid,
+                parent_mode_uid=base_mode.uid,
+                strategy_uid=strategy.uid,
+                reward_type="correctness_failure",
+                value=-2.0,
+                payload={"reason": st.reason},
+            )
             print(f"{indent}    ❌ 正确性测试失败，跳过")
             continue
         child = st.value
+        correctness = (child.extra or {}).get("correctness") if isinstance(child.extra, dict) else None
+        score = None
+        if isinstance(correctness, dict):
+            try:
+                score = float(correctness.get("score"))
+            except (TypeError, ValueError):
+                score = None
+        record_evaluation(
+            child.uid, "correctness", ok=bool(child.correctness_passed),
+            metric_name="last_token_logits_cosine", metric_value=score,
+            payload=correctness or {},
+        )
+        record_mode(child)
         if not child.correctness_passed:
+            record_reward(
+                child.uid,
+                parent_mode_uid=base_mode.uid,
+                strategy_uid=strategy.uid,
+                reward_type="correctness_failure",
+                value=-2.0,
+                payload=correctness or {},
+            )
             print(f"{indent}    ❌ 输出不一致，跳过")
             continue
         print(f"{indent}    ✅ 正确性通过，递归优化 ...")
@@ -236,6 +360,16 @@ def run(
 
     # 一次优化 run 只会有一个 ledger
     ledger = RunLedger(run_uid=f"run:{model_id}:{int(time.time())}", model_id=model_id)
+    start_run_trace(
+        ledger.run_uid,
+        model_id,
+        {
+            "model_dir": model_dir,
+            "top_k": top_k,
+            "max_depth": max_depth,
+        },
+    )
+    record_mode(baseline, payload={"role": "baseline"})
     set_current_ledger(ledger)
     try:
         best_mode, best_lat = optimize(baseline, ledger, top_k=top_k, max_depth=max_depth)
@@ -244,4 +378,20 @@ def run(
         return best_mode, best_lat
     finally:
         write_ledger(ledger)
+        finalize_run_trace(
+            {
+                "run_uid": ledger.run_uid,
+                "model_id": ledger.model_id,
+                "stop_reason": ledger.stop_reason,
+                "best_mode_uid": ledger.best_mode_uid,
+                "best_latency": ledger.best_latency,
+                "baseline_latency": ledger.baseline_latency,
+            },
+            {
+                "speedup": (
+                    ledger.baseline_latency / ledger.best_latency
+                    if ledger.baseline_latency and ledger.best_latency else None
+                )
+            },
+        )
         set_current_ledger(None)

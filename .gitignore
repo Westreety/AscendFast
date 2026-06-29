@@ -22,3 +22,11 @@ kernels/ascendc_ops/_installed_opp/
 *.o
 *.a
 *.run
+
+# agent一些需要忽略信息
+.claude/settings.local.json
+
+#vscode 设置
+.vscode/
+
+goal.md

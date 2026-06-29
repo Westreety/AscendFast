@@ -15,7 +15,7 @@ import json
 from dataclasses import asdict
 from pathlib import Path
 
-from models import ChangeRecord, ExecutionMode
+from models import ChangeRecord, ExecutionMode, ModelMetadata
 
 # 一个 ExecutionMode workspace 里的 manifest 文件名。
 MANIFEST_NAME = "mode_manifest.json"
@@ -33,6 +33,7 @@ def write_manifest(mode: ExecutionMode) -> None:
         "entrypoint": mode.entrypoint,
         "change_log": [asdict(r) for r in mode.change_log],
         "correctness_passed": mode.correctness_passed,
+        "model_metadata": asdict(mode.model_metadata) if mode.model_metadata is not None else None,
         "extra": mode.extra,
     }
     path = Path(mode.workspace_dir) / MANIFEST_NAME
@@ -43,6 +44,7 @@ def load_mode(work_dir: Path) -> ExecutionMode:
     """从 work_dir/mode_manifest.json 还原一个 ExecutionMode。"""
     data = json.loads((work_dir / MANIFEST_NAME).read_text(encoding="utf-8"))
     change_log = [ChangeRecord(**r) for r in data.get("change_log", [])]
+    metadata = data.get("model_metadata")
     return ExecutionMode(
         uid=data["uid"],
         model_id=data["model_id"],
@@ -52,5 +54,6 @@ def load_mode(work_dir: Path) -> ExecutionMode:
         entrypoint=data.get("entrypoint", DEFAULT_ENTRYPOINT),
         change_log=change_log,
         correctness_passed=data.get("correctness_passed"),
+        model_metadata=ModelMetadata(**metadata) if isinstance(metadata, dict) else None,
         extra=data.get("extra"),
     )

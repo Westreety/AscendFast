@@ -27,6 +27,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from models import ExecutionMode, OperatorArtifact, OptimizationStrategy, RunLedger, StageOutcome
+from trace_store import record_event
 
 _LEDGER_NAME = "run_ledger.json"
 _PROJECT_ROOT = Path(__file__).parent
@@ -180,3 +181,13 @@ def write_ledger(ledger: RunLedger) -> Path:
 def _record(ledger: RunLedger | None, outcome: StageOutcome) -> None:
     if ledger is not None:
         ledger.outcomes.append(outcome)
+    record_event(
+        "stage_outcome",
+        {
+            "stage": outcome.stage,
+            "ok": outcome.ok,
+            "reason": outcome.reason,
+            "metadata": outcome.metadata,
+        },
+        refs={"mode_uid": outcome.mode_uid, "stage": outcome.stage},
+    )
